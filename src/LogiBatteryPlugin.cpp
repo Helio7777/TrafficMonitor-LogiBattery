@@ -1,28 +1,70 @@
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <commctrl.h>
+
 #include "TrafficMonitorPluginABI.h"
 #include "LogitechHidpp.h"
+#include "MchoseHid.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cwchar>
+#include <iterator>
 #include <mutex>
 #include <string>
 
+#pragma comment(lib, "comctl32.lib")
+
 namespace
 {
-    using logibattery::BatterySnapshot;
-    using logibattery::PowerStatus;
+    using mousebattery::BatterySnapshot;
+    using mousebattery::PowerStatus;
 
-    class LogiBatteryItem final : public IPluginItem
+    enum class DeviceBrand : int
+    {
+        Logitech = 0,
+        Mchose = 1,
+    };
+
+    const wchar_t* BrandDisplayName(DeviceBrand brand)
+    {
+        return brand == DeviceBrand::Mchose ? L"迈从 / MCHOSE" : L"Logitech / Logi";
+    }
+
+    class MouseBatteryItem final : public IPluginItem
     {
     public:
-        const wchar_t* GetItemName() const override { return L"Logi 鼠标电量"; }
+        const wchar_t* GetItemName() const override
+        {
+            return L"鼠标电量 (Logi/MCHOSE)";
+        }
+
+        // Keep the v1 item ID so upgrading does not reset TrafficMonitor's
+        // existing display/color configuration for this item.
         const wchar_t* GetItemId() const override { return L"LogiMouseBatteryV1"; }
-        const wchar_t* GetItemLableText() const override { return L"Logi:"; }
+
+        const wchar_t* GetItemLableText() const override
+        {
+            return brand_.load() == DeviceBrand::Mchose ? L"MCHOSE:" : L"Logi:";
+        }
+
         const wchar_t* GetItemValueSampleText() const override { return L"100%+"; }
 
         const wchar_t* GetItemValueText() const override
         {
+            // TrafficMonitor consumes the returned pointer after this call.  Copy
+            // into per-thread storage so a concurrent DataRequired() update cannot
+            // invalidate the string buffer.
+            thread_local std::wstring copy;
             std::lock_guard lock(mutex_);
-            return value_.c_str();
+            copy = value_;
+            return copy.c_str();
+        }
+
+        void SetBrand(DeviceBrand brand)
+        {
+            brand_.store(brand);
         }
 
         void Update(const BatterySnapshot& s)
@@ -44,23 +86,26 @@ namespace
             usage_ = static_cast<float>(std::clamp(s.percent, 0, 100)) / 100.0f;
         }
 
-        // Set this to 1 if you want TrafficMonitor to draw its resource graph
-        // behind the item.  Kept off by default for a clean battery readout.
         int IsDrawResourceUsageGraph() const override { return 0; }
-        float GetResourceUsageGraphValue() const override { return usage_; }
+        float GetResourceUsageGraphValue() const override
+        {
+            std::lock_guard lock(mutex_);
+            return usage_;
+        }
 
     private:
+        std::atomic<DeviceBrand> brand_{ DeviceBrand::Logitech };
         mutable std::mutex mutex_;
         std::wstring value_ = L"--";
         float usage_ = 0.0f;
     };
 
-    class LogiBatteryPlugin final : public ITMPlugin
+    class MouseBatteryPlugin final : public ITMPlugin
     {
     public:
-        static LogiBatteryPlugin& Instance()
+        static MouseBatteryPlugin& Instance()
         {
-            static LogiBatteryPlugin instance;
+            static MouseBatteryPlugin instance;
             return instance;
         }
 
@@ -71,64 +116,158 @@ namespace
 
         void DataRequired() override
         {
-            service_.Start();
-            const auto snapshot = service_.GetSnapshot();
+            BatterySnapshot snapshot;
+            DeviceBrand selected = DeviceBrand::Logitech;
+            {
+                std::lock_guard lock(serviceMutex_);
+                selected = brand_.load();
+                if (selected == DeviceBrand::Mchose)
+                {
+                    mchoseService_.Start();
+                    snapshot = mchoseService_.GetSnapshot();
+                }
+                else
+                {
+                    logitechService_.Start();
+                    snapshot = logitechService_.GetSnapshot();
+                }
+            }
+
+            item_.SetBrand(selected);
             item_.Update(snapshot);
 
             std::lock_guard lock(textMutex_);
-            tooltip_ = BuildTooltip(snapshot);
+            tooltip_ = BuildTooltip(snapshot, selected);
+        }
+
+        OptionReturn ShowOptionsDialog(void* hParent) override
+        {
+            const DeviceBrand before = brand_.load();
+            int selectedRadio = before == DeviceBrand::Mchose ? 102 : 101;
+            int pressedButton = IDCANCEL;
+
+            const TASKDIALOG_BUTTON radios[] = {
+                { 101, L"Logitech / Logi（HID++ 2.0）" },
+                { 102, L"迈从 / MCHOSE（dsh-mchose-battery HID 方法）" },
+            };
+
+            TASKDIALOGCONFIG config{};
+            config.cbSize = sizeof(config);
+            config.hwndParent = static_cast<HWND>(hParent);
+            config.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_SIZE_TO_CONTENT;
+            config.dwCommonButtons = TDCBF_OK_BUTTON | TDCBF_CANCEL_BUTTON;
+            config.pszWindowTitle = L"鼠标电量插件设置";
+            config.pszMainInstruction = L"选择要读取的鼠标品牌";
+            config.pszContent = L"选择后将立即停止旧品牌的读取线程，并使用对应 HID 协议刷新电量。";
+            config.cRadioButtons = static_cast<UINT>(std::size(radios));
+            config.pRadioButtons = radios;
+            config.nDefaultRadioButton = selectedRadio;
+
+            const HRESULT hr = TaskDialogIndirect(
+                &config, &pressedButton, &selectedRadio, nullptr);
+
+            if (FAILED(hr))
+            {
+                const int fallback = MessageBoxW(
+                    static_cast<HWND>(hParent),
+                    L"请选择读取方式：\n\n“是” = Logitech / Logi\n“否” = 迈从 / MCHOSE\n“取消” = 保持不变",
+                    L"鼠标电量插件设置",
+                    MB_YESNOCANCEL | MB_ICONQUESTION);
+                if (fallback == IDCANCEL)
+                    return OR_OPTION_UNCHANGED;
+                selectedRadio = fallback == IDYES ? 101 : 102;
+                pressedButton = IDOK;
+            }
+
+            if (pressedButton != IDOK)
+                return OR_OPTION_UNCHANGED;
+
+            const DeviceBrand after = selectedRadio == 102 ? DeviceBrand::Mchose : DeviceBrand::Logitech;
+            if (after == before)
+                return OR_OPTION_UNCHANGED;
+
+            ApplyBrand(after, true);
+            return OR_OPTION_CHANGED;
         }
 
         const wchar_t* GetInfo(PluginInfoIndex index) override
         {
             switch (index)
             {
-            case TMI_NAME:        return L"Logi Mouse Battery";
-            case TMI_DESCRIPTION: return L"在 TrafficMonitor 中显示 Logitech/Logi HID++ 鼠标电量。原生 Win32 HID，无需运行 LGSTrayBattery。";
+            case TMI_NAME:        return L"Mouse Battery (Logi / MCHOSE)";
+            case TMI_DESCRIPTION: return L"TrafficMonitor 鼠标电量插件：可在选项中切换 Logitech HID++ 或迈从 MCHOSE HID 电量读取。";
             case TMI_AUTHOR:      return L"OpenAI / user project";
-            case TMI_COPYRIGHT:   return L"GPL-3.0-or-later; HID++ implementation based on public protocol behavior and LGSTrayBattery references";
-            case TMI_VERSION:     return L"1.0.0";
-            case TMI_URL:         return L"https://github.com/andyvorld/LGSTrayBattery";
+            case TMI_COPYRIGHT:   return L"GPL-3.0-or-later; Logitech reference: LGSTrayBattery; MCHOSE reference: dsh-mchose-battery (MIT)";
+            case TMI_VERSION:     return L"1.1.0";
+            case TMI_URL:         return L"https://github.com/Fransice/dsh-mchose-battery";
             default:              return L"";
             }
         }
 
         const wchar_t* GetTooltipInfo() override
         {
+            thread_local std::wstring copy;
             std::lock_guard lock(textMutex_);
-            return tooltip_.c_str();
+            copy = tooltip_;
+            return copy.c_str();
         }
 
         int GetCommandCount() override { return 1; }
 
         const wchar_t* GetCommandName(int command_index) override
         {
-            return command_index == 0 ? L"立即刷新 Logi 鼠标电量" : nullptr;
+            return command_index == 0 ? L"立即刷新鼠标电量" : nullptr;
         }
 
         void OnPluginCommand(int command_index, void*, void*) override
         {
-            if (command_index == 0)
-                service_.RequestRefresh();
+            if (command_index != 0)
+                return;
+
+            std::lock_guard lock(serviceMutex_);
+            if (brand_.load() == DeviceBrand::Mchose)
+                mchoseService_.RequestRefresh();
+            else
+                logitechService_.RequestRefresh();
         }
 
         void OnInitialize(ITrafficMonitor*) override
         {
-            service_.Start();
+            StartSelectedService();
+        }
+
+        void OnExtenedInfo(ExtendedInfoIndex index, const wchar_t* data) override
+        {
+            if (index != EI_CONFIG_DIR || !data || !*data)
+                return;
+
+            {
+                std::lock_guard lock(configMutex_);
+                configDir_ = data;
+            }
+
+            const DeviceBrand loaded = LoadBrand();
+            if (loaded != brand_.load())
+                ApplyBrand(loaded, false);
         }
 
     private:
-        static std::wstring BuildTooltip(const BatterySnapshot& s)
+        static std::wstring BuildTooltip(const BatterySnapshot& s, DeviceBrand brand)
         {
+            std::wstring text = BrandDisplayName(brand);
+            text += L" 鼠标电量";
+
             if (!s.online)
             {
-                std::wstring text = L"Logi Mouse Battery\n未检测到支持 HID++ 2.0 电量功能的 Logitech 鼠标";
+                text += brand == DeviceBrand::Mchose
+                    ? L"\n未读取到 MCHOSE 电量（VID 0x3837 / UsagePage 0xFF01）"
+                    : L"\n未检测到支持 HID++ 2.0 电量功能的 Logitech 鼠标";
                 if (!s.error.empty())
                     text += L"\n" + s.error;
                 return text;
             }
 
-            std::wstring text = s.deviceName.empty() ? L"Logitech Mouse" : s.deviceName;
+            text += L"\n" + (s.deviceName.empty() ? std::wstring(L"Mouse") : s.deviceName);
             text += L"\n电量: " + std::to_wstring(s.percent) + L"%";
 
             switch (s.status)
@@ -140,24 +279,117 @@ namespace
             default: break;
             }
 
+            if (!s.connectionMode.empty())
+                text += L"\n连接: " + s.connectionMode;
             if (s.milliVolts > 0)
                 text += L"\n电压: " + std::to_wstring(s.milliVolts) + L" mV";
             if (!s.source.empty())
-                text += L"\nHID++ 特性: " + s.source;
+                text += L"\n读取方式: " + s.source;
             return text;
         }
 
-        LogiBatteryPlugin() = default;
-        ~LogiBatteryPlugin() { service_.Stop(); }
+        std::wstring ConfigPath() const
+        {
+            std::lock_guard lock(configMutex_);
+            if (configDir_.empty())
+                return {};
 
-        LogiBatteryItem item_;
-        logibattery::LogitechBatteryService service_;
+            std::wstring path = configDir_;
+            if (!path.empty() && path.back() != L'\\' && path.back() != L'/')
+                path += L'\\';
+            path += L"LogiBatteryPlugin.ini";
+            return path;
+        }
+
+        DeviceBrand LoadBrand() const
+        {
+            const std::wstring path = ConfigPath();
+            if (path.empty())
+                return brand_.load();
+
+            wchar_t value[32]{};
+            GetPrivateProfileStringW(
+                L"MouseBattery", L"Brand", L"logitech", value,
+                static_cast<DWORD>(std::size(value)), path.c_str());
+            return (_wcsicmp(value, L"mchose") == 0) ? DeviceBrand::Mchose : DeviceBrand::Logitech;
+        }
+
+        void SaveBrand(DeviceBrand brand) const
+        {
+            const std::wstring path = ConfigPath();
+            if (path.empty())
+                return;
+            WritePrivateProfileStringW(
+                L"MouseBattery",
+                L"Brand",
+                brand == DeviceBrand::Mchose ? L"mchose" : L"logitech",
+                path.c_str());
+        }
+
+        void StartSelectedService()
+        {
+            std::lock_guard lock(serviceMutex_);
+            if (brand_.load() == DeviceBrand::Mchose)
+                mchoseService_.Start();
+            else
+                logitechService_.Start();
+        }
+
+        void ApplyBrand(DeviceBrand brand, bool persist)
+        {
+            {
+                std::lock_guard lock(serviceMutex_);
+                const DeviceBrand old = brand_.load();
+                if (old != brand)
+                {
+                    if (old == DeviceBrand::Mchose)
+                        mchoseService_.Stop();
+                    else
+                        logitechService_.Stop();
+
+                    brand_.store(brand);
+                    item_.SetBrand(brand);
+                    // Do not show a stale value from the previously selected brand
+                    // while the new backend performs its first asynchronous query.
+                    item_.Update(BatterySnapshot{});
+
+                    if (brand == DeviceBrand::Mchose)
+                        mchoseService_.RequestRefresh();
+                    else
+                        logitechService_.RequestRefresh();
+                }
+            }
+
+            if (persist)
+                SaveBrand(brand);
+
+            std::lock_guard textLock(textMutex_);
+            tooltip_ = std::wstring(BrandDisplayName(brand)) + L" 鼠标电量\n正在刷新…";
+        }
+
+        MouseBatteryPlugin() = default;
+        ~MouseBatteryPlugin()
+        {
+            std::lock_guard lock(serviceMutex_);
+            logitechService_.Stop();
+            mchoseService_.Stop();
+        }
+
+        MouseBatteryItem item_;
+        std::atomic<DeviceBrand> brand_{ DeviceBrand::Logitech };
+        logibattery::LogitechBatteryService logitechService_;
+        mousebattery::MchoseBatteryService mchoseService_;
+
+        mutable std::mutex serviceMutex_;
+        mutable std::mutex configMutex_;
+        std::wstring configDir_;
+
         std::mutex textMutex_;
-        std::wstring tooltip_ = L"Logi Mouse Battery\n正在检测鼠标…";
+        std::wstring tooltip_ = L"Logitech / Logi 鼠标电量\n正在检测鼠标…";
     };
 }
 
 extern "C" __declspec(dllexport) ITMPlugin* TMPluginGetInstance()
 {
-    return &LogiBatteryPlugin::Instance();
+    return &MouseBatteryPlugin::Instance();
 }

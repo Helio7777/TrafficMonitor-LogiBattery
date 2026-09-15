@@ -1,33 +1,88 @@
-# TrafficMonitor Logi Mouse Battery Plugin
+# TrafficMonitor Mouse Battery Plugin (Logi / MCHOSE)
 
-一个用于 **TrafficMonitor** 的原生 C++ 插件，在主窗口/任务栏显示 Logitech（Logi）无线鼠标电量。
+一个用于 **TrafficMonitor** 的原生 C++ 鼠标电量插件。可在插件选项中选择：
 
-## 特点
+- **Logitech / Logi**：Windows HID + HID++ 2.0
+- **迈从 / MCHOSE**：按 `Fransice/dsh-mchose-battery` 的 WebHID 协议行为移植为原生 Windows HID
 
-- 直接通过 Windows HID + Logitech **HID++ 2.0** 读取电量。
-- 不要求运行 LGSTrayBattery，也不依赖 .NET 或额外的 `hidapi.dll`。
-- 参考 LGSTrayBattery 当前 Native HID 实现的设备发现与电量特性选择逻辑：
-  - Logitech VID `0x046D`
-  - vendor-defined HID UsagePage `0xFFxx`
-  - Usage `0x0001` = HID++ short，`0x0002` = HID++ long
-  - 鼠标 DeviceType = `3`
-  - 电量特性优先级：`0x1000` → `0x1001` → `0x1004`
-- 后台线程查询，不在 TrafficMonitor 的显示调用中执行阻塞 HID I/O。
-- 默认成功读取后每 600 秒轮询一次；失败后每 10 秒重试，与 LGSTrayBattery Native 路径的默认 `PollPeriod=600` / `RetryTime=10` 对齐。
-- 插件菜单提供“立即刷新 Logi 鼠标电量”。
+当前版本：**v1.1.0**。
+
+## v1.1.0 新增：迈从 MCHOSE
+
+在 TrafficMonitor 中打开：
+
+```text
+右键 TrafficMonitor → 其他功能 → 插件管理 → Mouse Battery (Logi / MCHOSE) → 选项
+```
+
+可选择：
+
+```text
+○ Logitech / Logi（HID++ 2.0）
+○ 迈从 / MCHOSE（dsh-mchose-battery HID 方法）
+```
+
+点击“确定”后立即切换读取线程，不需要重启 TrafficMonitor。选择会保存到 TrafficMonitor 提供的插件配置目录：
+
+```text
+LogiBatteryPlugin.ini
+```
+
+## MCHOSE 读取方式
+
+按 `dsh-mchose-battery` 当前实现移植：
+
+- VID：`0x3837`
+- 配置 HID UsagePage：`0xFF01`
+- 查询 Report ID：`0x11`
+- 输入 Report ID：`0x13`
+- 查询 payload：64 字节，默认 `0xFF`，前两个字节分别为 `0x0B ^ 0xFF`、`0xAA ^ 0xFF`
+- 对输入 `0x13` 的 payload 每个字节执行 `XOR 0xFF`
+- 解码后首字节必须为 `0xE2`
+- `byte[4]`：电量百分比
+- `byte[3] != 0`：充电中
+- `byte[9...]`：设备名（ASCII，遇 `0x00` 结束）
+- 有线 USB PID：`0x4018`
+- 2.4G PID：`0x100A`
+- 优先有线，再选 2.4G；其他 `VID 0x3837 + UsagePage 0xFF01` 接口也会作为 fallback 尝试
+- 与原项目一致，每 **5 秒**刷新一次
+
+原项目通过 WebHID 先调用 `sendFeatureReport()`，失败后回退 `sendReport()`；本插件对应使用 Windows `HidD_SetFeature()`，失败时回退到 HID output report。
+
+## Logitech 读取方式
+
+保持 v1.0.0 的 Native HID++ 实现：
+
+- Logitech VID `0x046D`
+- vendor-defined HID UsagePage `0xFFxx`
+- Usage `0x0001` = HID++ short，`0x0002` = HID++ long
+- 鼠标 DeviceType = `3`
+- 电量特性优先级：`0x1000` → `0x1001` → `0x1004`
+- 默认成功读取后 600 秒轮询一次，失败后 10 秒重试
+
+Logitech 分支参考 LGSTrayBattery 的 Native HID 行为，不要求安装或运行 LGSTrayBattery、G HUB、Options+。
 
 ## 显示
 
 - `85%`：正常使用电池
 - `85%+`：充电中
 - `100%=`：已充满
-- `N/A`：当前未读取到支持的鼠标电量
+- `N/A`：当前未获取到电量
 
-鼠标悬停 TrafficMonitor 时，插件 Tooltip 会显示鼠标名称、百分比、充电状态、电压（若设备使用 0x1001）以及命中的 HID++ 电量特性。
+显示项 ID 继续使用 v1.0.0 的 `LogiMouseBatteryV1`，因此覆盖升级 DLL 时不会主动重置 TrafficMonitor 中已有的显示项/颜色配置。
+
+Tooltip 会显示：
+
+- 当前选择的品牌
+- 鼠标名称
+- 电量和充电状态
+- MCHOSE 的 USB / 2.4G 模式
+- Logitech 的电压（若使用 HID++ `0x1001`）
+- 实际读取方式
 
 ## 编译
 
-推荐 Visual Studio 2022 + CMake。工程使用静态 MSVC CRT，并通过 `.def` 文件确保 x64/Win32 都以精确名称导出 `TMPluginGetInstance`。
+推荐 Visual Studio 2022 + CMake。
 
 ### x64
 
@@ -36,7 +91,7 @@ cmake -S . -B build-x64 -G "Visual Studio 17 2022" -A x64
 cmake --build build-x64 --config Release
 ```
 
-DLL 位于：
+生成：
 
 ```text
 build-x64\Release\LogiBatteryPlugin.dll
@@ -44,69 +99,67 @@ build-x64\Release\LogiBatteryPlugin.dll
 
 ### Win32
 
-如果你使用 32 位 TrafficMonitor：
-
 ```bat
 cmake -S . -B build-x86 -G "Visual Studio 17 2022" -A Win32
 cmake --build build-x86 --config Release
 ```
 
-> 插件 DLL 的位数必须和 TrafficMonitor.exe 一致。
+> DLL 位数必须与 TrafficMonitor.exe 一致。
 
-### 一键构建（PowerShell）
-
-也可以在项目根目录运行：
+### PowerShell
 
 ```powershell
 .\build.ps1 -Arch x64
-# 或：.\build.ps1 -Arch Win32
+# 或
+.\build.ps1 -Arch Win32
 ```
 
-项目还包含 `.github/workflows/build.yml`，可在 GitHub Actions 中自动构建 x64 / Win32 DLL 并检查入口导出。
+工程仍通过 `.def` 强制导出精确的 `TMPluginGetInstance`。
 
-## 安装
+## 安装 / 从 v1.0.0 升级
 
-把 `LogiBatteryPlugin.dll` 放到：
+将新版本：
+
+```text
+LogiBatteryPlugin.dll
+```
+
+覆盖到：
 
 ```text
 TrafficMonitor\plugins\LogiBatteryPlugin.dll
 ```
 
-重新启动 TrafficMonitor，然后：
+然后重启 TrafficMonitor。
 
-1. 右键 TrafficMonitor。
-2. 打开插件管理，确认 `Logi Mouse Battery` 已加载。
-3. 在任务栏窗口/主窗口“显示设置”里勾选 `Logi 鼠标电量`。
+首次仍默认选择 **Logitech / Logi**，如果使用迈从鼠标，请进入插件管理的“选项”切换到 **迈从 / MCHOSE**。
 
-## 兼容性说明
+## MCHOSE 兼容性
 
-当前版本聚焦 **HID++ 2.0** 鼠标，并按 LGSTrayBattery 的 Native HID 路径实现。理论上适用于使用 Unifying / Bolt / Lightspeed / 直接 HID++ 接口且提供 0x1000、0x1001 或 0x1004 电量特性的 Logitech 鼠标。
+本分支严格围绕 `dsh-mchose-battery` 使用的协议族实现。已明确针对：
 
-以下情况可能显示 `N/A`：
+- `VID 0x3837`
+- `PID 0x4018`：USB wired
+- `PID 0x100A`：2.4G receiver
 
-- 鼠标处于深度休眠，暂时不响应 HID++ ping；
-- 设备只暴露 HID++ 1.0 电量接口；
-- 某些新版设备/驱动隐藏了 vendor-defined HID++ collection；
-- G HUB / Options+ 或第三方程序独占了 HID 接口；
-- 某设备的 short/long collection 没有相同 Windows Container ID。
+也会尝试同 VID、同 `0xFF01` 配置 UsagePage 的其他 PID，但其他迈从型号是否采用同一个 E2 协议需要实机验证。
+
+若显示 `N/A`，常见原因：
+
+- 鼠标休眠，查询时没有返回 E2 report；
+- 型号使用不同 PID / 不同 HID 协议；
+- Windows 上对应 HID collection 无法以读写方式打开；
+- 其他配置软件正在独占接口。
 
 ## 设计来源与许可
 
-TrafficMonitor 插件 ABI：
+TrafficMonitor Plugin API：
 - https://github.com/zhongyang219/TrafficMonitor
 
-HID++ 获取方式参考：
+Logitech HID++ 参考：
 - https://github.com/andyvorld/LGSTrayBattery
 
-本项目重新以原生 Win32 HID 实现协议流程；其中 0x1001 的通用 Li-Po 电压查表沿用 LGSTrayBattery 的公开 GPL-3.0 实现思路和数据，因此本项目整体采用 **GPL-3.0-or-later**。
+MCHOSE HID 参考：
+- https://github.com/Fransice/dsh-mchose-battery
 
-## 下一步建议
-
-如果要做成更完整的发布版本，建议继续加入：
-
-- 多鼠标选择/按设备名称固定显示；
-- 配置界面（轮询周期、显示名称、充电符号）；
-- G HUB WebSocket `ws://localhost:9010` fallback；
-- HID++ 1.0 旧设备 fallback；
-- DeviceChange 热插拔即时重扫；
-- x64 / x86 GitHub Actions 自动构建发布 DLL。
+`dsh-mchose-battery` 为 MIT License；LGSTrayBattery 为 GPL-3.0。由于 Logitech 分支包含基于其 GPL 实现思路/数据的部分，本工程整体继续采用 **GPL-3.0-or-later**。

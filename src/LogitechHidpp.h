@@ -7,27 +7,12 @@
 #include <string>
 #include <thread>
 
+#include "MouseBatteryTypes.h"
+
 namespace logibattery
 {
-    enum class PowerStatus
-    {
-        Unknown,
-        Discharging,
-        Charging,
-        Full,
-        NotCharging,
-    };
-
-    struct BatterySnapshot
-    {
-        bool online = false;
-        std::wstring deviceName;
-        int percent = -1;
-        int milliVolts = -1;
-        PowerStatus status = PowerStatus::Unknown;
-        std::wstring source;
-        std::wstring error;
-    };
+    using mousebattery::BatterySnapshot;
+    using mousebattery::PowerStatus;
 
     class LogitechBatteryService
     {

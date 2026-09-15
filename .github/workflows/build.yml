@@ -1,4 +1,4 @@
-name: Build TrafficMonitor LogiBattery Plugin
+name: Build TrafficMonitor Mouse Battery Plugin
 
 on:
   workflow_dispatch:
