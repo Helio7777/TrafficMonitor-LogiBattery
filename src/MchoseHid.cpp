@@ -22,12 +22,21 @@ namespace mousebattery
 {
     namespace
     {
-        constexpr USHORT kMchoseVid = 0x3837;
+        constexpr USHORT kLegacyMchoseVid = 0x3837;
+        constexpr USHORT kG3AVid = 0xA8A5;
+        constexpr USHORT kG3APid = 0x2255;
         constexpr USHORT kConfigUsagePage = 0xFF01;
+        constexpr USHORT kG3AUsage = 0x0010;
         constexpr USHORT kWirelessPid = 0x100A;
         constexpr USHORT kWiredPid = 0x4018;
         constexpr BYTE kCommandReportId = 0x11;
         constexpr BYTE kInputReportId = 0x13;
+
+        enum class MchoseProtocol
+        {
+            LegacyE2,
+            G3A,
+        };
 
         struct HandleCloser
         {
@@ -50,10 +59,13 @@ namespace mousebattery
         {
             std::wstring path;
             std::wstring productName;
+            USHORT vendorId = 0;
             USHORT productId = 0;
+            USHORT usage = 0;
             USHORT inputReportLength = 0;
             USHORT outputReportLength = 0;
             USHORT featureReportLength = 0;
+            MchoseProtocol protocol = MchoseProtocol::LegacyE2;
         };
 
         std::wstring ReadProductName(HANDLE handle)
@@ -66,13 +78,15 @@ namespace mousebattery
 
         int EndpointPriority(const MchoseEndpoint& endpoint)
         {
+            if (endpoint.protocol == MchoseProtocol::G3A)
+                return 0;
             // Same preference as dsh-mchose-battery: wired first because the
             // receiver can remain enumerated while the mouse is connected by USB.
             if (endpoint.productId == kWiredPid)
-                return 0;
-            if (endpoint.productId == kWirelessPid)
                 return 1;
-            return 2;
+            if (endpoint.productId == kWirelessPid)
+                return 2;
+            return 3;
         }
 
         std::vector<MchoseEndpoint> EnumerateMchoseEndpoints()
@@ -124,7 +138,7 @@ namespace mousebattery
                 HIDD_ATTRIBUTES attributes{};
                 attributes.Size = sizeof(attributes);
                 if (!HidD_GetAttributes(static_cast<HANDLE>(device.get()), &attributes) ||
-                    attributes.VendorID != kMchoseVid)
+                    (attributes.VendorID != kLegacyMchoseVid && attributes.VendorID != kG3AVid))
                     continue;
 
                 PHIDP_PREPARSED_DATA preparsed = nullptr;
@@ -136,14 +150,23 @@ namespace mousebattery
                 HidD_FreePreparsedData(preparsed);
                 if (capsStatus != HIDP_STATUS_SUCCESS || caps.UsagePage != kConfigUsagePage)
                     continue;
+                if (attributes.VendorID == kG3AVid &&
+                    (attributes.ProductID != kG3APid || caps.Usage != kG3AUsage))
+                    continue;
 
                 MchoseEndpoint endpoint;
                 endpoint.path = detail->DevicePath;
                 endpoint.productName = ReadProductName(static_cast<HANDLE>(device.get()));
+                endpoint.vendorId = attributes.VendorID;
                 endpoint.productId = attributes.ProductID;
+                endpoint.usage = caps.Usage;
                 endpoint.inputReportLength = caps.InputReportByteLength;
                 endpoint.outputReportLength = caps.OutputReportByteLength;
                 endpoint.featureReportLength = caps.FeatureReportByteLength;
+                endpoint.protocol = attributes.VendorID == kG3AVid &&
+                    attributes.ProductID == kG3APid
+                    ? MchoseProtocol::G3A
+                    : MchoseProtocol::LegacyE2;
                 endpoints.push_back(std::move(endpoint));
             }
 
@@ -155,16 +178,10 @@ namespace mousebattery
             return endpoints;
         }
 
-        bool WriteOutputReport(HANDLE handle, const MchoseEndpoint& endpoint, DWORD timeoutMs)
+        bool WriteReport(HANDLE handle,
+                         const std::vector<uint8_t>& report,
+                         DWORD timeoutMs)
         {
-            if (endpoint.outputReportLength < 3)
-                return false;
-
-            std::vector<uint8_t> report(endpoint.outputReportLength, 0xFF);
-            report[0] = kCommandReportId;
-            report[1] = static_cast<uint8_t>(0x0B ^ 0xFF); // WebHID payload byte 0
-            report[2] = static_cast<uint8_t>(0xAA ^ 0xFF); // WebHID payload byte 1
-
             UniqueHandle event = MakeHandle(CreateEventW(nullptr, TRUE, FALSE, nullptr));
             if (!event)
                 return false;
@@ -189,8 +206,47 @@ namespace mousebattery
             return written > 0;
         }
 
+        bool WriteLegacyOutputReport(HANDLE handle,
+                                     const MchoseEndpoint& endpoint,
+                                     DWORD timeoutMs)
+        {
+            if (endpoint.outputReportLength < 3)
+                return false;
+
+            std::vector<uint8_t> report(endpoint.outputReportLength, 0xFF);
+            report[0] = kCommandReportId;
+            report[1] = static_cast<uint8_t>(0x0B ^ 0xFF); // WebHID payload byte 0
+            report[2] = static_cast<uint8_t>(0xAA ^ 0xFF); // WebHID payload byte 1
+            return WriteReport(handle, report, timeoutMs);
+        }
+
+        bool WriteG3ABatteryReport(HANDLE handle,
+                                   const MchoseEndpoint& endpoint,
+                                   DWORD timeoutMs)
+        {
+            if (endpoint.outputReportLength < 11)
+                return false;
+
+            // The official MCHOSE G-series page sends report ID 0 with this
+            // 0x55/0x30/0xA5/0x0B/0x2E battery command.
+            std::vector<uint8_t> report(endpoint.outputReportLength, 0);
+            report[0] = 0x00;
+            report[1] = 0x55;
+            report[2] = 0x30;
+            report[3] = 0xA5;
+            report[4] = 0x0B;
+            report[5] = 0x2E;
+            report[6] = 0x01;
+            report[7] = 0x01;
+            report[8] = 0x01;
+            return WriteReport(handle, report, timeoutMs);
+        }
+
         bool SendReloadCommand(HANDLE handle, const MchoseEndpoint& endpoint)
         {
+            if (endpoint.protocol == MchoseProtocol::G3A)
+                return WriteG3ABatteryReport(handle, endpoint, 300);
+
             // dsh-mchose-battery first calls sendFeatureReport(0x11, 64 bytes)
             // and falls back to sendReport.  Windows HidD_SetFeature includes the
             // report ID in byte 0, hence the +1 shape here.
@@ -204,7 +260,7 @@ namespace mousebattery
                     return true;
             }
 
-            return WriteOutputReport(handle, endpoint, 300);
+            return WriteLegacyOutputReport(handle, endpoint, 300);
         }
 
         bool ReadOneReport(HANDLE handle,
@@ -297,6 +353,33 @@ namespace mousebattery
             return true;
         }
 
+        bool ParseG3ABatteryReport(const std::vector<uint8_t>& report,
+                                   const MchoseEndpoint& endpoint,
+                                   BatterySnapshot& snapshot)
+        {
+            // Windows ReadFile includes report ID at byte 0. The WebHID page
+            // observes the remaining bytes as AA 30 ... battery charge.
+            if (report.size() < 11 || report[0] != 0x00 ||
+                report[1] != 0xAA || report[2] != 0x30)
+                return false;
+
+            const int battery = report[9];
+            if (battery < 0 || battery > 100)
+                return false;
+
+            snapshot.online = true;
+            snapshot.deviceName = endpoint.productName.empty()
+                ? L"MCHOSE G3 A"
+                : endpoint.productName;
+            snapshot.percent = battery;
+            snapshot.status = report[10] != 0
+                ? PowerStatus::Charging
+                : (battery >= 100 ? PowerStatus::Full : PowerStatus::Discharging);
+            snapshot.connectionMode = L"2.4G";
+            snapshot.source = L"MCHOSE G3 A / HID report 0x30";
+            return true;
+        }
+
         bool QueryEndpoint(const MchoseEndpoint& endpoint, BatterySnapshot& snapshot)
         {
             UniqueHandle device = MakeHandle(CreateFileW(
@@ -324,7 +407,10 @@ namespace mousebattery
                 std::vector<uint8_t> report;
                 if (!ReadOneReport(handle, endpoint, report, timeout))
                     continue;
-                if (ParseE2Report(report, endpoint, snapshot))
+                const bool parsed = endpoint.protocol == MchoseProtocol::G3A
+                    ? ParseG3ABatteryReport(report, endpoint, snapshot)
+                    : ParseE2Report(report, endpoint, snapshot);
+                if (parsed)
                     return true;
             }
             return false;
@@ -418,7 +504,7 @@ namespace mousebattery
         const auto endpoints = EnumerateMchoseEndpoints();
         if (endpoints.empty())
         {
-            result.error = L"未找到 VID 0x3837、UsagePage 0xFF01 的 MCHOSE 配置 HID 接口。";
+            result.error = L"未找到 MCHOSE 配置 HID 接口（VID 0x3837，或 G3 A 的 A8A5:2255 / FF01:0010）。";
             return result;
         }
 
@@ -429,7 +515,7 @@ namespace mousebattery
                 return candidate;
         }
 
-        result.error = L"已检测到 MCHOSE 配置接口，但未收到可解码的 E2 电量报告；鼠标可能休眠或该型号协议不同。";
+        result.error = L"已检测到 MCHOSE 配置接口，但未收到可解码的电量报告；鼠标可能休眠或型号协议不同。";
         return result;
     }
 }

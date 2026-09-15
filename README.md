@@ -5,9 +5,9 @@
 - **Logitech / Logi**：Windows HID + HID++ 2.0
 - **迈从 / MCHOSE**：按 `Fransice/dsh-mchose-battery` 的 WebHID 协议行为移植为原生 Windows HID
 
-当前版本：**v1.1.0**。
+当前版本：**v1.1.1**。
 
-## v1.1.0 新增：迈从 MCHOSE
+## v1.1.x：迈从 MCHOSE 支持
 
 在 TrafficMonitor 中打开：
 
@@ -29,6 +29,16 @@ LogiBatteryPlugin.ini
 ```
 
 ## MCHOSE 读取方式
+
+### MCHOSE G3 A（实测）
+
+- VID/PID：`0xA8A5:0x2255`
+- 配置接口：`UsagePage 0xFF01`、`Usage 0x0010`（MI_02）
+- 查询报告：报告 ID `0`，发送 `55 30 A5 0B 2E 01 01 01`，其余补零
+- 返回报告：`AA 30 ...`，第 9 个数据字节为电量百分比，第 10 个数据字节为充电标志
+- 实测返回示例：`00 AA 30 A5 0B 0A 01 01 01 61 00 ...`，表示 `97%`、未充电
+
+### 旧 MCHOSE 协议
 
 按 `dsh-mchose-battery` 当前实现移植：
 
@@ -136,17 +146,18 @@ TrafficMonitor\plugins\LogiBatteryPlugin.dll
 
 ## MCHOSE 兼容性
 
-本分支严格围绕 `dsh-mchose-battery` 使用的协议族实现。已明确针对：
+当前实现包含旧 E2 协议，以及已实测的 G3 A 专用协议。已明确针对：
 
 - `VID 0x3837`
 - `PID 0x4018`：USB wired
 - `PID 0x100A`：2.4G receiver
+- `VID/PID 0xA8A5:0x2255`、`UsagePage 0xFF01`、`Usage 0x0010`：MCHOSE G3 A
 
-也会尝试同 VID、同 `0xFF01` 配置 UsagePage 的其他 PID，但其他迈从型号是否采用同一个 E2 协议需要实机验证。
+旧协议会尝试同 VID、同 `0xFF01` 配置 UsagePage 的其他 PID，但其他迈从型号是否采用同一个 E2 协议需要实机验证。
 
 若显示 `N/A`，常见原因：
 
-- 鼠标休眠，查询时没有返回 E2 report；
+- 鼠标休眠，查询时没有返回电量 report；
 - 型号使用不同 PID / 不同 HID 协议；
 - Windows 上对应 HID collection 无法以读写方式打开；
 - 其他配置软件正在独占接口。

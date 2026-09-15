@@ -198,7 +198,7 @@ namespace
             case TMI_DESCRIPTION: return L"TrafficMonitor 鼠标电量插件：可在选项中切换 Logitech HID++ 或迈从 MCHOSE HID 电量读取。";
             case TMI_AUTHOR:      return L"OpenAI / user project";
             case TMI_COPYRIGHT:   return L"GPL-3.0-or-later; Logitech reference: LGSTrayBattery; MCHOSE reference: dsh-mchose-battery (MIT)";
-            case TMI_VERSION:     return L"1.1.0";
+            case TMI_VERSION:     return L"1.1.1";
             case TMI_URL:         return L"https://github.com/Fransice/dsh-mchose-battery";
             default:              return L"";
             }
@@ -260,7 +260,7 @@ namespace
             if (!s.online)
             {
                 text += brand == DeviceBrand::Mchose
-                    ? L"\n未读取到 MCHOSE 电量（VID 0x3837 / UsagePage 0xFF01）"
+                    ? L"\n未读取到 MCHOSE 电量（支持 G3 A: A8A5:2255 / FF01:0010）"
                     : L"\n未检测到支持 HID++ 2.0 电量功能的 Logitech 鼠标";
                 if (!s.error.empty())
                     text += L"\n" + s.error;
