@@ -1,0 +1,35 @@
+name: Build TrafficMonitor LogiBattery Plugin
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        arch: [x64, Win32]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        shell: pwsh
+        run: cmake -S . -B "build-${{ matrix.arch }}" -G "Visual Studio 17 2022" -A "${{ matrix.arch }}"
+      - name: Build
+        shell: pwsh
+        run: cmake --build "build-${{ matrix.arch }}" --config Release
+      - name: Verify exported TrafficMonitor entry point
+        shell: pwsh
+        run: |
+          $dll = Resolve-Path "build-${{ matrix.arch }}/Release/LogiBatteryPlugin.dll"
+          $dumpbin = (Get-ChildItem "${env:ProgramFiles}/Microsoft Visual Studio/2022/Enterprise/VC/Tools/MSVC/*/bin/Hostx64/x64/dumpbin.exe" | Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          if (-not $dumpbin) { throw "dumpbin.exe not found" }
+          $exports = & $dumpbin /EXPORTS $dll
+          $exports | Out-Host
+          if ($exports -notmatch "\bTMPluginGetInstance\b") { throw "TMPluginGetInstance export missing" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LogiBatteryPlugin-${{ matrix.arch }}
+          path: build-${{ matrix.arch }}/Release/LogiBatteryPlugin.dll

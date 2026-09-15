@@ -1,0 +1,7 @@
+/build*/
+/.vs/
+*.user
+*.suo
+*.VC.db
+*.pdb
+*.ilk
