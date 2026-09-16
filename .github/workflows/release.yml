@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, Win32]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches project version
+        shell: pwsh
+        run: |
+          $content = Get-Content CMakeLists.txt -Raw
+          if ($content -notmatch 'project\([^\)]*VERSION\s+([0-9]+\.[0-9]+\.[0-9]+)') {
+            throw "Could not read the project version from CMakeLists.txt"
+          }
+          $expected = "v$($Matches[1])"
+          if ($env:GITHUB_REF_NAME -ne $expected) {
+            throw "Tag $env:GITHUB_REF_NAME does not match project version $expected"
+          }
+
+      - name: Configure
+        shell: pwsh
+        run: >-
+          cmake -S . -B "build-${{ matrix.arch }}"
+          -G "Visual Studio 17 2022" -A "${{ matrix.arch }}"
+          -DLOGIBATTERY_PROJECT_URL="${{ github.server_url }}/${{ github.repository }}"
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build "build-${{ matrix.arch }}" --config Release
+
+      - name: Verify export and package
+        shell: pwsh
+        run: |
+          $dll = Resolve-Path "build-${{ matrix.arch }}/Release/LogiBatteryPlugin.dll"
+          $dumpbin = (Get-ChildItem "${env:ProgramFiles}/Microsoft Visual Studio/2022/Enterprise/VC/Tools/MSVC/*/bin/Hostx64/x64/dumpbin.exe" | Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          if (-not $dumpbin) { throw "dumpbin.exe not found" }
+          $exports = & $dumpbin /EXPORTS $dll
+          if ($exports -notmatch "\bTMPluginGetInstance\b") { throw "TMPluginGetInstance export missing" }
+
+          $baseName = "LogiBatteryPlugin-$env:GITHUB_REF_NAME-${{ matrix.arch }}"
+          $stage = Join-Path package $baseName
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          $packageFiles = @($dll.Path, 'README.md', 'README.en.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md')
+          Copy-Item -Path $packageFiles -Destination $stage
+          Compress-Archive -Path $stage -DestinationPath "package/$baseName.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.arch }}
+          path: package/*.zip
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.zip --verify-tag --generate-notes

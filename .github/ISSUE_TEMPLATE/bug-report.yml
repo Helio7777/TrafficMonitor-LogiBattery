@@ -1,0 +1,63 @@
+name: Bug report
+description: Report a reproducible plugin problem
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include full HID device paths, serial numbers, or unredacted captures.
+  - type: input
+    id: version
+    attributes:
+      label: Plugin version
+      placeholder: 1.1.1
+    validations:
+      required: true
+  - type: dropdown
+    id: architecture
+    attributes:
+      label: TrafficMonitor architecture
+      options:
+        - x64
+        - Win32
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Mouse model and connection
+      placeholder: MCHOSE G3 A, 2.4 GHz receiver
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe what happened and what you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Start TrafficMonitor
+        2. Select ...
+        3. Run ...
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Include tooltip text or logs after removing unique identifiers.
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I tested the latest release.
+          required: true
+        - label: I removed device paths, serial numbers, and other unique identifiers.
+          required: true

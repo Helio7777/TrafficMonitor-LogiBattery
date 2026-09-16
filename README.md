@@ -1,176 +1,69 @@
-# TrafficMonitor Mouse Battery Plugin (Logi / MCHOSE)
+# TrafficMonitor Mouse Battery
 
-一个用于 **TrafficMonitor** 的原生 C++ 鼠标电量插件。可在插件选项中选择：
+[English](README.en.md)
 
-- **Logitech / Logi**：Windows HID + HID++ 2.0
-- **迈从 / MCHOSE**：按 `Fransice/dsh-mchose-battery` 的 WebHID 协议行为移植为原生 Windows HID
+一个面向 Windows 的原生 [TrafficMonitor](https://github.com/zhongyang219/TrafficMonitor) 鼠标电量插件。在任务栏或主窗口中显示 Logitech 与 MCHOSE 鼠标的电量、充电状态和连接信息。
 
-当前版本：**v1.1.1**。
+插件直接访问 Windows HID，不依赖 G HUB、Options+ 或厂商常驻程序，也不会上传设备信息。
 
-## v1.1.x：迈从 MCHOSE 支持
+## 功能
 
-在 TrafficMonitor 中打开：
+- 支持 Logitech HID++ 2.0 电量特性 `0x1000`、`0x1001` 和 `0x1004`。
+- 支持已实机验证的 MCHOSE G3 A，以及部分采用旧版 E2 协议的 MCHOSE 设备。
+- 可在插件选项中切换品牌，配置会随 TrafficMonitor 保存。
+- 显示电量、充电或充满状态，并在工具提示中提供设备和连接信息。
+- 提供 x64 与 Win32 构建，使用静态 MSVC 运行库。
 
-```text
-右键 TrafficMonitor → 其他功能 → 插件管理 → Mouse Battery (Logi / MCHOSE) → 选项
+## 兼容性
+
+| 品牌 / 设备 | 状态 | 说明 |
+| --- | --- | --- |
+| Logitech HID++ 2.0 鼠标 | 支持 | 实际可用性取决于设备是否公开受支持的电量特性。 |
+| MCHOSE G3 A (`A8A5:2255`) | 已验证 | 支持原生 2.4G HID 电量读取。 |
+| MCHOSE `VID 3837` 设备 | 实验性 | 支持公开的 E2 协议；不同型号可能采用其他协议。 |
+
+欢迎通过 [设备支持请求](../../issues/new?template=device-support.yml) 提交未覆盖的型号。请勿公开上传完整设备路径或未经脱敏的 HID 抓包。
+
+## 安装
+
+1. 从 [Releases](../../releases) 下载与 `TrafficMonitor.exe` 位数一致的压缩包。
+2. 解压并将 `LogiBatteryPlugin.dll` 放入 TrafficMonitor 的 `plugins` 目录。
+3. 重启 TrafficMonitor，在插件管理中启用 **Mouse Battery** 显示项。
+4. 使用 MCHOSE 时，在插件“选项”中将读取品牌切换为 **MCHOSE**。
+
+显示值含义：`85%` 表示使用电池，`85%+` 表示充电中，`100%=` 表示已充满，`N/A` 表示暂时未读取到电量。
+
+## 构建
+
+需要 Windows、Visual Studio 2022（含“使用 C++ 的桌面开发”）和 CMake 3.20 或更高版本。
+
+```powershell
+.\build.ps1 -Arch x64 -Config Release
+.\build.ps1 -Arch Win32 -Config Release
 ```
 
-可选择：
+产物位于 `build-x64\Release` 或 `build-Win32\Release`。也可以直接使用 CMake：
 
-```text
-○ Logitech / Logi（HID++ 2.0）
-○ 迈从 / MCHOSE（dsh-mchose-battery HID 方法）
-```
-
-点击“确定”后立即切换读取线程，不需要重启 TrafficMonitor。选择会保存到 TrafficMonitor 提供的插件配置目录：
-
-```text
-LogiBatteryPlugin.ini
-```
-
-## MCHOSE 读取方式
-
-### MCHOSE G3 A（实测）
-
-- VID/PID：`0xA8A5:0x2255`
-- 配置接口：`UsagePage 0xFF01`、`Usage 0x0010`（MI_02）
-- 查询报告：报告 ID `0`，发送 `55 30 A5 0B 2E 01 01 01`，其余补零
-- 返回报告：`AA 30 ...`，第 9 个数据字节为电量百分比，第 10 个数据字节为充电标志
-- 实测返回示例：`00 AA 30 A5 0B 0A 01 01 01 61 00 ...`，表示 `97%`、未充电
-
-### 旧 MCHOSE 协议
-
-按 `dsh-mchose-battery` 当前实现移植：
-
-- VID：`0x3837`
-- 配置 HID UsagePage：`0xFF01`
-- 查询 Report ID：`0x11`
-- 输入 Report ID：`0x13`
-- 查询 payload：64 字节，默认 `0xFF`，前两个字节分别为 `0x0B ^ 0xFF`、`0xAA ^ 0xFF`
-- 对输入 `0x13` 的 payload 每个字节执行 `XOR 0xFF`
-- 解码后首字节必须为 `0xE2`
-- `byte[4]`：电量百分比
-- `byte[3] != 0`：充电中
-- `byte[9...]`：设备名（ASCII，遇 `0x00` 结束）
-- 有线 USB PID：`0x4018`
-- 2.4G PID：`0x100A`
-- 优先有线，再选 2.4G；其他 `VID 0x3837 + UsagePage 0xFF01` 接口也会作为 fallback 尝试
-- 与原项目一致，每 **5 秒**刷新一次
-
-原项目通过 WebHID 先调用 `sendFeatureReport()`，失败后回退 `sendReport()`；本插件对应使用 Windows `HidD_SetFeature()`，失败时回退到 HID output report。
-
-## Logitech 读取方式
-
-保持 v1.0.0 的 Native HID++ 实现：
-
-- Logitech VID `0x046D`
-- vendor-defined HID UsagePage `0xFFxx`
-- Usage `0x0001` = HID++ short，`0x0002` = HID++ long
-- 鼠标 DeviceType = `3`
-- 电量特性优先级：`0x1000` → `0x1001` → `0x1004`
-- 默认成功读取后 600 秒轮询一次，失败后 10 秒重试
-
-Logitech 分支参考 LGSTrayBattery 的 Native HID 行为，不要求安装或运行 LGSTrayBattery、G HUB、Options+。
-
-## 显示
-
-- `85%`：正常使用电池
-- `85%+`：充电中
-- `100%=`：已充满
-- `N/A`：当前未获取到电量
-
-显示项 ID 继续使用 v1.0.0 的 `LogiMouseBatteryV1`，因此覆盖升级 DLL 时不会主动重置 TrafficMonitor 中已有的显示项/颜色配置。
-
-Tooltip 会显示：
-
-- 当前选择的品牌
-- 鼠标名称
-- 电量和充电状态
-- MCHOSE 的 USB / 2.4G 模式
-- Logitech 的电压（若使用 HID++ `0x1001`）
-- 实际读取方式
-
-## 编译
-
-推荐 Visual Studio 2022 + CMake。
-
-### x64
-
-```bat
+```powershell
 cmake -S . -B build-x64 -G "Visual Studio 17 2022" -A x64
 cmake --build build-x64 --config Release
 ```
 
-生成：
-
-```text
-build-x64\Release\LogiBatteryPlugin.dll
-```
-
-### Win32
-
-```bat
-cmake -S . -B build-x86 -G "Visual Studio 17 2022" -A Win32
-cmake --build build-x86 --config Release
-```
-
-> DLL 位数必须与 TrafficMonitor.exe 一致。
-
-### PowerShell
+发布构建可通过 `-ProjectUrl` 写入插件主页，例如：
 
 ```powershell
-.\build.ps1 -Arch x64
-# 或
-.\build.ps1 -Arch Win32
+.\build.ps1 -Arch x64 -ProjectUrl "https://github.com/OWNER/REPOSITORY"
 ```
 
-工程仍通过 `.def` 强制导出精确的 `TMPluginGetInstance`。
+## 排查
 
-## 安装 / 从 v1.0.0 升级
+- 确认 DLL 与 TrafficMonitor 的架构一致。
+- 唤醒鼠标后执行插件命令“立即刷新鼠标电量”。
+- 退出可能独占配置接口的厂商软件后重试。
+- 查看工具提示中的检测结果；未知型号可能需要新增协议适配。
 
-将新版本：
+## 参与项目
 
-```text
-LogiBatteryPlugin.dll
-```
+架构与 HID 后端说明见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。提交代码前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md) 和 [SECURITY.md](SECURITY.md)。版本变化记录在 [CHANGELOG.md](CHANGELOG.md)。
 
-覆盖到：
-
-```text
-TrafficMonitor\plugins\LogiBatteryPlugin.dll
-```
-
-然后重启 TrafficMonitor。
-
-首次仍默认选择 **Logitech / Logi**，如果使用迈从鼠标，请进入插件管理的“选项”切换到 **迈从 / MCHOSE**。
-
-## MCHOSE 兼容性
-
-当前实现包含旧 E2 协议，以及已实测的 G3 A 专用协议。已明确针对：
-
-- `VID 0x3837`
-- `PID 0x4018`：USB wired
-- `PID 0x100A`：2.4G receiver
-- `VID/PID 0xA8A5:0x2255`、`UsagePage 0xFF01`、`Usage 0x0010`：MCHOSE G3 A
-
-旧协议会尝试同 VID、同 `0xFF01` 配置 UsagePage 的其他 PID，但其他迈从型号是否采用同一个 E2 协议需要实机验证。
-
-若显示 `N/A`，常见原因：
-
-- 鼠标休眠，查询时没有返回电量 report；
-- 型号使用不同 PID / 不同 HID 协议；
-- Windows 上对应 HID collection 无法以读写方式打开；
-- 其他配置软件正在独占接口。
-
-## 设计来源与许可
-
-TrafficMonitor Plugin API：
-- https://github.com/zhongyang219/TrafficMonitor
-
-Logitech HID++ 参考：
-- https://github.com/andyvorld/LGSTrayBattery
-
-MCHOSE HID 参考：
-- https://github.com/Fransice/dsh-mchose-battery
-
-`dsh-mchose-battery` 为 MIT License；LGSTrayBattery 为 GPL-3.0。由于 Logitech 分支包含基于其 GPL 实现思路/数据的部分，本工程整体继续采用 **GPL-3.0-or-later**。
+项目采用 [GPL-3.0-or-later](LICENSE) 许可。第三方实现参考与许可信息见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

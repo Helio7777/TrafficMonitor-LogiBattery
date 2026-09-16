@@ -1,9 +1,20 @@
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <commctrl.h>
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4100)
+#endif
 #include "TrafficMonitorPluginABI.h"
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 #include "LogitechHidpp.h"
 #include "MchoseHid.h"
 
@@ -15,6 +26,10 @@
 #include <string>
 
 #pragma comment(lib, "comctl32.lib")
+
+#ifndef LOGIBATTERY_PROJECT_URL
+#define LOGIBATTERY_PROJECT_URL L""
+#endif
 
 namespace
 {
@@ -37,7 +52,7 @@ namespace
     public:
         const wchar_t* GetItemName() const override
         {
-            return L"鼠标电量 (Logi/MCHOSE)";
+            return L"鼠标电量 (Logitech / MCHOSE)";
         }
 
         // Keep the v1 item ID so upgrading does not reset TrafficMonitor's
@@ -147,8 +162,8 @@ namespace
             int pressedButton = IDCANCEL;
 
             const TASKDIALOG_BUTTON radios[] = {
-                { 101, L"Logitech / Logi（HID++ 2.0）" },
-                { 102, L"迈从 / MCHOSE（dsh-mchose-battery HID 方法）" },
+                { 101, L"Logitech（HID++ 2.0）" },
+                { 102, L"MCHOSE / 迈从（原生 HID）" },
             };
 
             TASKDIALOGCONFIG config{};
@@ -158,7 +173,7 @@ namespace
             config.dwCommonButtons = TDCBF_OK_BUTTON | TDCBF_CANCEL_BUTTON;
             config.pszWindowTitle = L"鼠标电量插件设置";
             config.pszMainInstruction = L"选择要读取的鼠标品牌";
-            config.pszContent = L"选择后将立即停止旧品牌的读取线程，并使用对应 HID 协议刷新电量。";
+            config.pszContent = L"插件会保存此设置，并立即使用对应的设备协议刷新电量。";
             config.cRadioButtons = static_cast<UINT>(std::size(radios));
             config.pRadioButtons = radios;
             config.nDefaultRadioButton = selectedRadio;
@@ -170,7 +185,7 @@ namespace
             {
                 const int fallback = MessageBoxW(
                     static_cast<HWND>(hParent),
-                    L"请选择读取方式：\n\n“是” = Logitech / Logi\n“否” = 迈从 / MCHOSE\n“取消” = 保持不变",
+                    L"请选择读取方式：\n\n“是” = Logitech\n“否” = MCHOSE / 迈从\n“取消” = 保持不变",
                     L"鼠标电量插件设置",
                     MB_YESNOCANCEL | MB_ICONQUESTION);
                 if (fallback == IDCANCEL)
@@ -194,12 +209,12 @@ namespace
         {
             switch (index)
             {
-            case TMI_NAME:        return L"Mouse Battery (Logi / MCHOSE)";
-            case TMI_DESCRIPTION: return L"TrafficMonitor 鼠标电量插件：可在选项中切换 Logitech HID++ 或迈从 MCHOSE HID 电量读取。";
-            case TMI_AUTHOR:      return L"OpenAI / user project";
-            case TMI_COPYRIGHT:   return L"GPL-3.0-or-later; Logitech reference: LGSTrayBattery; MCHOSE reference: dsh-mchose-battery (MIT)";
+            case TMI_NAME:        return L"Mouse Battery for TrafficMonitor";
+            case TMI_DESCRIPTION: return L"显示 Logitech 与 MCHOSE 鼠标的电量、充电状态和连接信息。";
+            case TMI_AUTHOR:      return L"TrafficMonitor Mouse Battery contributors";
+            case TMI_COPYRIGHT:   return L"GPL-3.0-or-later; see THIRD_PARTY_NOTICES.md";
             case TMI_VERSION:     return L"1.1.1";
-            case TMI_URL:         return L"https://github.com/Fransice/dsh-mchose-battery";
+            case TMI_URL:         return LOGIBATTERY_PROJECT_URL;
             default:              return L"";
             }
         }
@@ -260,7 +275,7 @@ namespace
             if (!s.online)
             {
                 text += brand == DeviceBrand::Mchose
-                    ? L"\n未读取到 MCHOSE 电量（支持 G3 A: A8A5:2255 / FF01:0010）"
+                    ? L"\n未读取到 MCHOSE 电量；请唤醒设备后重试"
                     : L"\n未检测到支持 HID++ 2.0 电量功能的 Logitech 鼠标";
                 if (!s.error.empty())
                     text += L"\n" + s.error;
@@ -385,7 +400,7 @@ namespace
         std::wstring configDir_;
 
         std::mutex textMutex_;
-        std::wstring tooltip_ = L"Logitech / Logi 鼠标电量\n正在检测鼠标…";
+        std::wstring tooltip_ = L"Logitech 鼠标电量\n正在检测鼠标…";
     };
 }
 

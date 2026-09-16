@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(TrafficMonitorLogiBattery VERSION 1.1.1 LANGUAGES CXX)
 
+set(LOGIBATTERY_PROJECT_URL "" CACHE STRING "Public project homepage embedded in plugin metadata")
+
 add_library(LogiBatteryPlugin SHARED
     src/LogiBatteryPlugin.cpp
     src/LogitechHidpp.cpp
@@ -21,6 +23,13 @@ target_compile_definitions(LogiBatteryPlugin PRIVATE
     NOMINMAX
     _WIN32_WINNT=0x0602
 )
+
+if(LOGIBATTERY_PROJECT_URL)
+    string(REPLACE "\"" "\\\"" LOGIBATTERY_PROJECT_URL_ESCAPED "${LOGIBATTERY_PROJECT_URL}")
+    target_compile_definitions(LogiBatteryPlugin PRIVATE
+        LOGIBATTERY_PROJECT_URL=L\"${LOGIBATTERY_PROJECT_URL_ESCAPED}\"
+    )
+endif()
 
 if(MSVC)
     target_compile_options(LogiBatteryPlugin PRIVATE /W4 /permissive- /utf-8 /EHsc)
