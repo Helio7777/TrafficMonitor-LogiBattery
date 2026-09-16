@@ -15,7 +15,8 @@ concurrency:
 
 jobs:
   build:
-    runs-on: windows-latest
+    # Pin the image because the project uses the Visual Studio 17 2022 generator.
+    runs-on: windows-2022
     strategy:
       fail-fast: false
       matrix:

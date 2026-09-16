@@ -10,7 +10,8 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-latest
+    # Keep release builds on the same VS2022 image as CI.
+    runs-on: windows-2022
     strategy:
       fail-fast: false
       matrix:
