@@ -40,7 +40,7 @@ jobs:
           if (-not $dumpbin) { throw "dumpbin.exe not found" }
           $exports = & $dumpbin /EXPORTS $dll
           $exports | Out-Host
-          if ($exports -notmatch "\bTMPluginGetInstance\b") { throw "TMPluginGetInstance export missing" }
+          if (-not ($exports -match "\bTMPluginGetInstance\b")) { throw "TMPluginGetInstance export missing" }
       - uses: actions/upload-artifact@v4
         with:
           name: LogiBatteryPlugin-${{ matrix.arch }}

@@ -49,7 +49,7 @@ jobs:
           $dumpbin = (Get-ChildItem "${env:ProgramFiles}/Microsoft Visual Studio/2022/Enterprise/VC/Tools/MSVC/*/bin/Hostx64/x64/dumpbin.exe" | Sort-Object FullName -Descending | Select-Object -First 1).FullName
           if (-not $dumpbin) { throw "dumpbin.exe not found" }
           $exports = & $dumpbin /EXPORTS $dll
-          if ($exports -notmatch "\bTMPluginGetInstance\b") { throw "TMPluginGetInstance export missing" }
+          if (-not ($exports -match "\bTMPluginGetInstance\b")) { throw "TMPluginGetInstance export missing" }
 
           $baseName = "LogiBatteryPlugin-$env:GITHUB_REF_NAME-${{ matrix.arch }}"
           $stage = Join-Path package $baseName
