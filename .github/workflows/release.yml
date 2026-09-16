@@ -16,7 +16,7 @@ jobs:
       matrix:
         arch: [x64, Win32]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Verify tag matches project version
         shell: pwsh
