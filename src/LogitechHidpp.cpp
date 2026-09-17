@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <deque>
@@ -37,6 +38,7 @@ namespace logibattery
         constexpr USHORT kLogitechVid = 0x046D;
         constexpr BYTE kSoftwareId = 0x0A;
         constexpr BYTE kShortReportId = 0x10;
+        constexpr BYTE kLongReportId = 0x11;
         constexpr BYTE kMouseDeviceType = 3;
 
         struct HandleCloser
@@ -98,6 +100,48 @@ namespace logibattery
             bool hasShort = false;
             bool hasLong = false;
         };
+
+        enum class IoWaitResult
+        {
+            Completed,
+            Timeout,
+            Stopped,
+            Failed,
+        };
+
+        IoWaitResult WaitOverlappedIo(HANDLE device,
+                                      OVERLAPPED& ov,
+                                      DWORD timeoutMs,
+                                      HANDLE stopEvent,
+                                      DWORD& transferred)
+        {
+            HANDLE waitHandles[2] = { ov.hEvent, stopEvent };
+            const DWORD waitCount = stopEvent ? 2 : 1;
+            const DWORD waitResult = WaitForMultipleObjects(waitCount, waitHandles, FALSE, timeoutMs);
+            if (waitResult == WAIT_OBJECT_0)
+            {
+                if (!GetOverlappedResult(device, &ov, &transferred, FALSE))
+                    return IoWaitResult::Failed;
+                return IoWaitResult::Completed;
+            }
+
+            if (waitResult == WAIT_TIMEOUT || (stopEvent && waitResult == WAIT_OBJECT_0 + 1))
+            {
+                const bool stopped = stopEvent && waitResult == WAIT_OBJECT_0 + 1;
+                CancelIoEx(device, &ov);
+                DWORD completionBytes = 0;
+                if (!GetOverlappedResult(device, &ov, &completionBytes, TRUE))
+                {
+                    const DWORD error = GetLastError();
+                    if (error != ERROR_OPERATION_ABORTED)
+                        return IoWaitResult::Failed;
+                }
+                transferred = completionBytes;
+                return stopped ? IoWaitResult::Stopped : IoWaitResult::Timeout;
+            }
+
+            return IoWaitResult::Failed;
+        }
 
         std::map<std::wstring, EndpointGroup> EnumerateLogitechHidppGroups()
         {
@@ -217,7 +261,7 @@ namespace logibattery
             bool Valid() const { return static_cast<bool>(handle_); }
             HANDLE Handle() const { return static_cast<HANDLE>(handle_.get()); }
 
-            bool Write(const std::vector<uint8_t>& report, DWORD timeoutMs)
+            bool Write(const std::vector<uint8_t>& report, DWORD timeoutMs, HANDLE stopEvent)
             {
                 if (!Valid())
                     return false;
@@ -240,20 +284,15 @@ namespace logibattery
                     DWORD error = GetLastError();
                     if (error != ERROR_IO_PENDING)
                         return false;
-                    DWORD wait = WaitForSingleObject(ov.hEvent, timeoutMs);
-                    if (wait != WAIT_OBJECT_0)
-                    {
-                        CancelIoEx(Handle(), &ov);
-                        WaitForSingleObject(ov.hEvent, 50);
-                        return false;
-                    }
-                    if (!GetOverlappedResult(Handle(), &ov, &written, FALSE))
+                    const IoWaitResult waitResult =
+                        WaitOverlappedIo(Handle(), ov, timeoutMs, stopEvent, written);
+                    if (waitResult != IoWaitResult::Completed)
                         return false;
                 }
                 return written > 0;
             }
 
-            bool Read(std::vector<uint8_t>& report, DWORD timeoutMs)
+            bool Read(std::vector<uint8_t>& report, DWORD timeoutMs, HANDLE stopEvent)
             {
                 if (!Valid())
                     return false;
@@ -274,14 +313,9 @@ namespace logibattery
                     DWORD error = GetLastError();
                     if (error != ERROR_IO_PENDING)
                         return false;
-                    DWORD wait = WaitForSingleObject(ov.hEvent, timeoutMs);
-                    if (wait != WAIT_OBJECT_0)
-                    {
-                        CancelIoEx(Handle(), &ov);
-                        WaitForSingleObject(ov.hEvent, 50);
-                        return false;
-                    }
-                    if (!GetOverlappedResult(Handle(), &ov, &read, FALSE))
+                    const IoWaitResult waitResult =
+                        WaitOverlappedIo(Handle(), ov, timeoutMs, stopEvent, read);
+                    if (waitResult != IoWaitResult::Completed)
                         return false;
                 }
 
@@ -303,11 +337,24 @@ namespace logibattery
             UniqueHandle handle_;
         };
 
+        enum class HidppErrorType
+        {
+            None,
+            Hidpp10,
+            Hidpp20,
+        };
+
+        struct HidppError
+        {
+            HidppErrorType type = HidppErrorType::None;
+            BYTE code = 0;
+        };
+
         class HidppTransport
         {
         public:
-            explicit HidppTransport(const EndpointGroup& group)
-                : short_(group.shortEndpoint), long_(group.longEndpoint)
+            HidppTransport(const EndpointGroup& group, HANDLE stopEvent)
+                : short_(group.shortEndpoint), long_(group.longEndpoint), stopEvent_(stopEvent)
             {
                 if (short_.Valid())
                     shortReader_ = std::thread([this] { ReaderLoop(short_); });
@@ -325,12 +372,19 @@ namespace logibattery
                 if (longReader_.joinable()) longReader_.join();
             }
 
-            bool Valid() const { return short_.Valid() && long_.Valid(); }
+            bool Valid() const { return short_.Valid() || long_.Valid(); }
+            bool HasShortReport() const { return short_.Valid(); }
+            bool HasLongReport() const { return long_.Valid(); }
 
             std::optional<std::vector<uint8_t>> Transact(const std::vector<uint8_t>& request,
                                                          DWORD timeoutMs = 250)
             {
                 if (!Valid() || request.size() < 7)
+                    return std::nullopt;
+
+                std::vector<uint8_t> txReport;
+                HidEndpoint* writeEndpoint = SelectWriteEndpoint(request, txReport);
+                if (!writeEndpoint)
                     return std::nullopt;
 
                 std::lock_guard txLock(transactionMutex_);
@@ -339,54 +393,119 @@ namespace logibattery
                     messages_.clear();
                 }
 
-                if (!short_.Write(request, timeoutMs))
+                if (!writeEndpoint->Write(txReport, timeoutMs, stopEvent_))
                     return std::nullopt;
 
                 const auto deadline = std::chrono::steady_clock::now() +
-                                      std::chrono::milliseconds(timeoutMs);
+                    std::chrono::milliseconds(timeoutMs);
 
                 for (;;)
                 {
-                    std::unique_lock queueLock(queueMutex_);
-                    cv_.wait_until(queueLock, deadline, [this] {
-                        return stop_.load() || !messages_.empty();
-                    });
-
-                    while (!messages_.empty())
+                    std::vector<uint8_t> msg;
                     {
-                        auto msg = std::move(messages_.front());
-                        messages_.pop_front();
-                        queueLock.unlock();
+                        std::unique_lock queueLock(queueMutex_);
+                        while (messages_.empty() && !stop_.load())
+                        {
+                            const auto now = std::chrono::steady_clock::now();
+                            if (now >= deadline)
+                                return std::nullopt;
+                            cv_.wait_until(queueLock, deadline);
+                        }
 
-                        if (IsMatchingResponse(msg, request))
-                            return msg;
-                        if (IsErrorForDevice(msg, request[1]))
+                        if (stop_.load())
                             return std::nullopt;
 
-                        queueLock.lock();
+                        if (messages_.empty())
+                            continue;
+                        msg = std::move(messages_.front());
+                        messages_.pop_front();
                     }
 
-                    if (stop_.load() || std::chrono::steady_clock::now() >= deadline)
+                    if (IsResponseForRequest(request, msg))
+                        return msg;
+                    if (IsErrorForRequest(request, msg).has_value())
+                        return std::nullopt;
+
+                    if (std::chrono::steady_clock::now() >= deadline)
                         return std::nullopt;
                 }
             }
 
-        private:
-            static bool IsMatchingResponse(const std::vector<uint8_t>& msg,
-                                           const std::vector<uint8_t>& request)
+            static bool IsResponseForRequest(const std::vector<uint8_t>& request,
+                                             const std::vector<uint8_t>& response)
             {
-                if (msg.size() < 7 || request.size() < 7)
+                if (request.size() < 4 || response.size() < 4)
                     return false;
-                if (msg[1] != request[1])
+                if (response[1] != request[1]) // device index
                     return false;
-                if (msg[2] != request[2])
+                if (response[2] != request[2]) // feature index
                     return false;
-                return (msg[3] & 0x0F) == kSoftwareId;
+                if ((response[3] & 0x0F) != (request[3] & 0x0F)) // software id
+                    return false;
+                return (response[3] >> 4) == (request[3] >> 4); // function id
             }
 
-            static bool IsErrorForDevice(const std::vector<uint8_t>& msg, BYTE deviceIndex)
+            static std::optional<HidppError> IsErrorForRequest(
+                const std::vector<uint8_t>& request,
+                const std::vector<uint8_t>& response)
             {
-                return msg.size() >= 7 && msg[1] == deviceIndex && msg[2] == 0x8F;
+                if (request.size() < 4 || response.size() < 5)
+                    return std::nullopt;
+                if (response[1] != request[1])
+                    return std::nullopt;
+
+                if (response[2] == 0x8F)
+                {
+                    if (response.size() < 6)
+                        return std::nullopt;
+                    if (response[3] != request[2] || response[4] != request[3])
+                        return std::nullopt;
+                    return HidppError{ HidppErrorType::Hidpp10, response[5] };
+                }
+
+                if (response[2] == 0xFF)
+                {
+                    if (response.size() < 6)
+                        return std::nullopt;
+                    if (response[3] != request[2] || response[4] != request[3])
+                        return std::nullopt;
+                    return HidppError{ HidppErrorType::Hidpp20, response[5] };
+                }
+
+                return std::nullopt;
+            }
+
+        private:
+            HidEndpoint* SelectWriteEndpoint(const std::vector<uint8_t>& request,
+                                             std::vector<uint8_t>& txReport)
+            {
+                if (request.empty())
+                    return nullptr;
+
+                if (request[0] == kLongReportId)
+                {
+                    if (!long_.Valid())
+                        return nullptr;
+                    txReport = request;
+                    return &long_;
+                }
+
+                if (short_.Valid())
+                {
+                    txReport = request;
+                    if (txReport[0] != kShortReportId)
+                        txReport[0] = kShortReportId;
+                    return &short_;
+                }
+
+                if (!long_.Valid())
+                    return nullptr;
+
+                txReport.assign(20, 0);
+                const size_t copyBytes = std::min<size_t>(request.size(), txReport.size());
+                std::copy_n(request.begin(), copyBytes, txReport.begin());
+                txReport[0] = kLongReportId;
+                return &long_;
             }
 
             void ReaderLoop(HidEndpoint& endpoint)
@@ -394,8 +513,12 @@ namespace logibattery
                 while (!stop_.load())
                 {
                     std::vector<uint8_t> msg;
-                    if (!endpoint.Read(msg, 500))
+                    if (!endpoint.Read(msg, 500, stopEvent_))
+                    {
+                        if (stop_.load())
+                            break;
                         continue;
+                    }
                     {
                         std::lock_guard lock(queueMutex_);
                         if (messages_.size() >= 32)
@@ -408,6 +531,7 @@ namespace logibattery
 
             HidEndpoint short_;
             HidEndpoint long_;
+            HANDLE stopEvent_ = nullptr;
             std::thread shortReader_;
             std::thread longReader_;
             std::atomic<bool> stop_{ false };
@@ -419,11 +543,24 @@ namespace logibattery
 
         std::vector<uint8_t> MakeRequest(BYTE deviceIndex, BYTE featureIndex,
                                          BYTE functionId, BYTE p0 = 0,
-                                         BYTE p1 = 0, BYTE p2 = 0)
+                                         BYTE p1 = 0, BYTE p2 = 0,
+                                         bool longReport = false)
         {
-            return { kShortReportId, deviceIndex, featureIndex,
-                     static_cast<BYTE>((functionId << 4) | kSoftwareId),
-                     p0, p1, p2 };
+            if (!longReport)
+            {
+                return { kShortReportId, deviceIndex, featureIndex,
+                    static_cast<BYTE>((functionId << 4) | kSoftwareId),
+                    p0, p1, p2 };
+            }
+            std::vector<uint8_t> request(20, 0);
+            request[0] = kLongReportId;
+            request[1] = deviceIndex;
+            request[2] = featureIndex;
+            request[3] = static_cast<BYTE>((functionId << 4) | kSoftwareId);
+            request[4] = p0;
+            request[5] = p1;
+            request[6] = p2;
+            return request;
         }
 
         bool Ping(HidppTransport& transport, BYTE deviceIndex)
@@ -543,11 +680,47 @@ namespace logibattery
 
             for (size_t i = 0; i < kMilliVoltLut.size(); ++i)
             {
-                if (mv > kMilliVoltLut[i])
-                    return static_cast<int>(kMilliVoltLut.size() - i);
+                if (mv >= kMilliVoltLut[i])
+                    return std::clamp(static_cast<int>(kMilliVoltLut.size() - i), 0, 100);
             }
             return 0;
         }
+
+#ifndef NDEBUG
+        void RunHidppLogicSelfTest()
+        {
+            const auto request = MakeRequest(0x01, 0x0D, 0x02, 0xAA, 0xBB, 0xCC);
+            auto response = request;
+            assert(HidppTransport::IsResponseForRequest(request, response));
+
+            response[3] = static_cast<BYTE>(((0x03) << 4) | (response[3] & 0x0F));
+            assert(!HidppTransport::IsResponseForRequest(request, response));
+            response = request;
+            response[2] = 0x0E;
+            assert(!HidppTransport::IsResponseForRequest(request, response));
+            response = request;
+            response[1] = 0x02;
+            assert(!HidppTransport::IsResponseForRequest(request, response));
+            response = request;
+            response[3] = static_cast<BYTE>((response[3] & 0xF0) | 0x03);
+            assert(!HidppTransport::IsResponseForRequest(request, response));
+
+            const std::vector<uint8_t> hidpp10Error = { kShortReportId, 0x01, 0x8F, 0x0D, request[3], 0x02, 0x00 };
+            const auto parsed10 = HidppTransport::IsErrorForRequest(request, hidpp10Error);
+            assert(parsed10 && parsed10->type == HidppErrorType::Hidpp10);
+            const std::vector<uint8_t> hidpp20Error = { kShortReportId, 0x01, 0xFF, 0x0D, request[3], 0x09, 0x00 };
+            const auto parsed20 = HidppTransport::IsErrorForRequest(request, hidpp20Error);
+            assert(parsed20 && parsed20->type == HidppErrorType::Hidpp20);
+            assert(!HidppTransport::IsErrorForRequest(request, request));
+            const std::vector<uint8_t> otherDeviceError = { kShortReportId, 0x02, 0xFF, 0x0D, request[3], 0x09, 0x00 };
+            assert(!HidppTransport::IsErrorForRequest(request, otherDeviceError));
+
+            assert(VoltageToPercent(4300) == 100);
+            assert(VoltageToPercent(4186) == 100);
+            assert(VoltageToPercent(3800) == 47);
+            assert(VoltageToPercent(3000) == 0);
+        }
+#endif
 
         std::optional<BatterySnapshot> ReadBattery(HidppTransport& transport,
                                                    const HidppMouse& mouse)
@@ -611,11 +784,26 @@ namespace logibattery
         }
     }
 
-    LogitechBatteryService::LogitechBatteryService() = default;
+    LogitechBatteryService::LogitechBatteryService()
+    {
+        stopEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+#ifndef NDEBUG
+        static const bool kSelfTestRan = [] {
+            RunHidppLogicSelfTest();
+            return true;
+        }();
+        (void)kSelfTestRan;
+#endif
+    }
 
     LogitechBatteryService::~LogitechBatteryService()
     {
         Stop();
+        if (stopEvent_)
+        {
+            CloseHandle(stopEvent_);
+            stopEvent_ = nullptr;
+        }
     }
 
     void LogitechBatteryService::Start()
@@ -623,6 +811,9 @@ namespace logibattery
         bool expected = false;
         if (!started_.compare_exchange_strong(expected, true))
             return;
+
+        if (stopEvent_)
+            ResetEvent(stopEvent_);
 
         {
             std::lock_guard lock(wakeMutex_);
@@ -634,7 +825,7 @@ namespace logibattery
 
     void LogitechBatteryService::Stop()
     {
-        if (!started_.load())
+        if (!started_.exchange(false))
             return;
 
         {
@@ -642,10 +833,11 @@ namespace logibattery
             stopRequested_ = true;
             refreshRequested_ = true;
         }
+        if (stopEvent_)
+            SetEvent(stopEvent_);
         wakeCv_.notify_all();
-        if (worker_.joinable())
+        if (worker_.joinable() && worker_.get_id() != std::this_thread::get_id())
             worker_.join();
-        started_.store(false);
     }
 
     void LogitechBatteryService::RequestRefresh()
@@ -696,6 +888,9 @@ namespace logibattery
     BatterySnapshot LogitechBatteryService::QueryOnce()
     {
         BatterySnapshot result;
+        if (stopEvent_ && WaitForSingleObject(stopEvent_, 0) == WAIT_OBJECT_0)
+            return result;
+
         const auto groups = EnumerateLogitechHidppGroups();
         if (groups.empty())
         {
@@ -703,16 +898,23 @@ namespace logibattery
             return result;
         }
 
-        bool foundCompleteGroup = false;
+        bool foundEndpointGroup = false;
         bool foundMouse = false;
+        bool foundShortOnly = false;
+        bool foundLongOnly = false;
 
         for (const auto& [_, group] : groups)
         {
-            if (!group.hasShort || !group.hasLong)
-                continue;
-            foundCompleteGroup = true;
+            if (stopEvent_ && WaitForSingleObject(stopEvent_, 0) == WAIT_OBJECT_0)
+                return result;
 
-            HidppTransport transport(group);
+            if (!group.hasShort && !group.hasLong)
+                continue;
+            foundEndpointGroup = true;
+            foundShortOnly = foundShortOnly || (group.hasShort && !group.hasLong);
+            foundLongOnly = foundLongOnly || (!group.hasShort && group.hasLong);
+
+            HidppTransport transport(group, stopEvent_);
             if (!transport.Valid())
                 continue;
 
@@ -732,12 +934,17 @@ namespace logibattery
             }
         }
 
-        if (!foundCompleteGroup)
-            result.error = L"检测到 Logitech HID，但未找到可配对的 HID++ short/long 接口。";
+        if (!foundEndpointGroup)
+            result.error = L"检测到 Logitech HID，但没有可用的 HID++ endpoint。";
         else if (!foundMouse)
             result.error = L"未发现 HID++ 2.0 鼠标，或鼠标正在休眠/离线。";
         else
             result.error = L"发现 Logitech 鼠标，但当前无法读取电量。";
+
+        if (!result.error.empty() && (foundShortOnly || foundLongOnly))
+        {
+            result.error += L"（已按设备能力尝试 short-only/long-only endpoint）";
+        }
         return result;
     }
 }

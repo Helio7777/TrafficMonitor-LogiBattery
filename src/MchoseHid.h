@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <windows.h>
 
 namespace mousebattery
 {
@@ -36,6 +37,7 @@ namespace mousebattery
         std::atomic<bool> started_{ false };
         bool stopRequested_ = false;
         bool refreshRequested_ = false;
+        HANDLE stopEvent_ = nullptr;
 
         // Match dsh-mchose-battery's 5-second refresh behavior.
         int pollSeconds_ = 5;

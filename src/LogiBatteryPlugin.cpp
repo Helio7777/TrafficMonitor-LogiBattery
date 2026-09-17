@@ -213,7 +213,7 @@ namespace
             case TMI_DESCRIPTION: return L"显示 Logitech 与 MCHOSE 鼠标的电量、充电状态和连接信息。";
             case TMI_AUTHOR:      return L"TrafficMonitor Mouse Battery contributors";
             case TMI_COPYRIGHT:   return L"GPL-3.0-or-later; see THIRD_PARTY_NOTICES.md";
-            case TMI_VERSION:     return L"1.1.1";
+            case TMI_VERSION:     return L"1.1.2";
             case TMI_URL:         return LOGIBATTERY_PROJECT_URL;
             default:              return L"";
             }

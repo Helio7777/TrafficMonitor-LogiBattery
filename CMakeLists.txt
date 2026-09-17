@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(TrafficMonitorLogiBattery VERSION 1.1.1 LANGUAGES CXX)
+project(TrafficMonitorLogiBattery VERSION 1.1.2 LANGUAGES CXX)
 
 set(LOGIBATTERY_PROJECT_URL "" CACHE STRING "Public project homepage embedded in plugin metadata")
 
