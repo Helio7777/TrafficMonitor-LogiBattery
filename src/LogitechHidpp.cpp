@@ -120,27 +120,37 @@ namespace logibattery
             const DWORD waitResult = WaitForMultipleObjects(waitCount, waitHandles, FALSE, timeoutMs);
             if (waitResult == WAIT_OBJECT_0)
             {
-                if (!GetOverlappedResult(device, &ov, &transferred, FALSE))
+                // Even though the event is signaled, use the blocking form to make
+                // the completion guarantee explicit before ov/event/buffer unwind.
+                if (!GetOverlappedResult(device, &ov, &transferred, TRUE))
                     return IoWaitResult::Failed;
                 return IoWaitResult::Completed;
             }
 
-            if (waitResult == WAIT_TIMEOUT || (stopEvent && waitResult == WAIT_OBJECT_0 + 1))
+            const bool stopped = stopEvent && waitResult == WAIT_OBJECT_0 + 1;
+            const bool timedOut = waitResult == WAIT_TIMEOUT;
+            // Every non-completed path after ERROR_IO_PENDING must retire the
+            // request before its stack-backed OVERLAPPED, event, and buffer die.
+            // This also covers WAIT_FAILED.
+            CancelIoEx(device, &ov);
+            DWORD completionBytes = 0;
+            if (!GetOverlappedResult(device, &ov, &completionBytes, TRUE))
             {
-                const bool stopped = stopEvent && waitResult == WAIT_OBJECT_0 + 1;
-                CancelIoEx(device, &ov);
-                DWORD completionBytes = 0;
-                if (!GetOverlappedResult(device, &ov, &completionBytes, TRUE))
-                {
-                    const DWORD error = GetLastError();
-                    if (error != ERROR_OPERATION_ABORTED)
-                        return IoWaitResult::Failed;
-                }
-                transferred = completionBytes;
-                return stopped ? IoWaitResult::Stopped : IoWaitResult::Timeout;
+                const DWORD error = GetLastError();
+                if (error != ERROR_OPERATION_ABORTED)
+                    return IoWaitResult::Failed;
             }
-
+            transferred = completionBytes;
+            if (stopped)
+                return IoWaitResult::Stopped;
+            if (timedOut)
+                return IoWaitResult::Timeout;
             return IoWaitResult::Failed;
+        }
+
+        bool IsStopEventSignaled(HANDLE stopEvent)
+        {
+            return stopEvent && WaitForSingleObject(stopEvent, 0) == WAIT_OBJECT_0;
         }
 
         std::map<std::wstring, EndpointGroup> EnumerateLogitechHidppGroups()
@@ -263,7 +273,7 @@ namespace logibattery
 
             bool Write(const std::vector<uint8_t>& report, DWORD timeoutMs, HANDLE stopEvent)
             {
-                if (!Valid())
+                if (!Valid() || IsStopEventSignaled(stopEvent))
                     return false;
 
                 const size_t writeLength = std::max<size_t>(info_.outputReportLength, report.size());
@@ -294,7 +304,7 @@ namespace logibattery
 
             bool Read(std::vector<uint8_t>& report, DWORD timeoutMs, HANDLE stopEvent)
             {
-                if (!Valid())
+                if (!Valid() || IsStopEventSignaled(stopEvent))
                     return false;
 
                 const size_t readLength = info_.inputReportLength >= 7 ? info_.inputReportLength : 20;
@@ -379,7 +389,11 @@ namespace logibattery
             std::optional<std::vector<uint8_t>> Transact(const std::vector<uint8_t>& request,
                                                          DWORD timeoutMs = 250)
             {
-                if (!Valid() || request.size() < 7)
+                if (!Valid() || request.size() < 7 || StopRequested())
+                    return std::nullopt;
+
+                std::lock_guard txLock(transactionMutex_);
+                if (StopRequested())
                     return std::nullopt;
 
                 std::vector<uint8_t> txReport;
@@ -387,12 +401,13 @@ namespace logibattery
                 if (!writeEndpoint)
                     return std::nullopt;
 
-                std::lock_guard txLock(transactionMutex_);
                 {
                     std::lock_guard queueLock(queueMutex_);
                     messages_.clear();
                 }
 
+                if (StopRequested())
+                    return std::nullopt;
                 if (!writeEndpoint->Write(txReport, timeoutMs, stopEvent_))
                     return std::nullopt;
 
@@ -404,19 +419,11 @@ namespace logibattery
                     std::vector<uint8_t> msg;
                     {
                         std::unique_lock queueLock(queueMutex_);
-                        while (messages_.empty() && !stop_.load())
-                        {
-                            const auto now = std::chrono::steady_clock::now();
-                            if (now >= deadline)
-                                return std::nullopt;
-                            cv_.wait_until(queueLock, deadline);
-                        }
-
-                        if (stop_.load())
+                        const bool ready = cv_.wait_until(queueLock, deadline, [this] {
+                            return StopRequested() || !messages_.empty();
+                        });
+                        if (StopRequested() || !ready)
                             return std::nullopt;
-
-                        if (messages_.empty())
-                            continue;
                         msg = std::move(messages_.front());
                         messages_.pop_front();
                     }
@@ -476,6 +483,11 @@ namespace logibattery
             }
 
         private:
+            bool StopRequested() const
+            {
+                return stop_.load() || IsStopEventSignaled(stopEvent_);
+            }
+
             HidEndpoint* SelectWriteEndpoint(const std::vector<uint8_t>& request,
                                              std::vector<uint8_t>& txReport)
             {
@@ -510,15 +522,17 @@ namespace logibattery
 
             void ReaderLoop(HidEndpoint& endpoint)
             {
-                while (!stop_.load())
+                while (!StopRequested())
                 {
                     std::vector<uint8_t> msg;
                     if (!endpoint.Read(msg, 500, stopEvent_))
                     {
-                        if (stop_.load())
+                        if (StopRequested())
                             break;
                         continue;
                     }
+                    if (StopRequested())
+                        break;
                     {
                         std::lock_guard lock(queueMutex_);
                         if (messages_.size() >= 32)
@@ -527,6 +541,7 @@ namespace logibattery
                     }
                     cv_.notify_all();
                 }
+                cv_.notify_all();
             }
 
             HidEndpoint short_;
@@ -563,6 +578,14 @@ namespace logibattery
             return request;
         }
 
+        std::vector<uint8_t> MakeFapRequest(BYTE deviceIndex, BYTE featureIndex,
+                                            BYTE functionId, BYTE p0 = 0,
+                                            BYTE p1 = 0, BYTE p2 = 0)
+        {
+            // HID++ 2.0 Feature Access Protocol requests use the 0x11 long report.
+            return MakeRequest(deviceIndex, featureIndex, functionId, p0, p1, p2, true);
+        }
+
         bool Ping(HidppTransport& transport, BYTE deviceIndex)
         {
             static std::atomic<unsigned> payloadCounter{ 0x55 };
@@ -574,9 +597,9 @@ namespace logibattery
         std::optional<BYTE> GetFeatureIndex(HidppTransport& transport, BYTE deviceIndex,
                                             USHORT featureId)
         {
-            auto ret = transport.Transact(MakeRequest(deviceIndex, 0x00, 0x00,
-                                                      static_cast<BYTE>(featureId >> 8),
-                                                      static_cast<BYTE>(featureId & 0xFF), 0), 250);
+            auto ret = transport.Transact(MakeFapRequest(deviceIndex, 0x00, 0x00,
+                                                         static_cast<BYTE>(featureId >> 8),
+                                                         static_cast<BYTE>(featureId & 0xFF), 0), 250);
             if (!ret || ret->size() < 7)
                 return std::nullopt;
             BYTE index = (*ret)[4];
@@ -603,14 +626,14 @@ namespace logibattery
             if (!nameFeature)
                 return std::nullopt;
 
-            auto typeRet = transport.Transact(MakeRequest(deviceIndex, *nameFeature, 0x02), 250);
+            auto typeRet = transport.Transact(MakeFapRequest(deviceIndex, *nameFeature, 0x02), 250);
             if (!typeRet || typeRet->size() < 5 || (*typeRet)[4] != kMouseDeviceType)
                 return std::nullopt;
 
             HidppMouse mouse;
             mouse.deviceIndex = deviceIndex;
 
-            auto lengthRet = transport.Transact(MakeRequest(deviceIndex, *nameFeature, 0x00), 250);
+            auto lengthRet = transport.Transact(MakeFapRequest(deviceIndex, *nameFeature, 0x00), 250);
             if (lengthRet && lengthRet->size() >= 5)
             {
                 const size_t expectedLength = (*lengthRet)[4];
@@ -619,8 +642,8 @@ namespace logibattery
                 size_t offset = 0;
                 while (offset < expectedLength && offset < 255)
                 {
-                    auto chunk = transport.Transact(MakeRequest(deviceIndex, *nameFeature, 0x01,
-                                                                static_cast<BYTE>(offset)), 250);
+                    auto chunk = transport.Transact(MakeFapRequest(deviceIndex, *nameFeature, 0x01,
+                                                                   static_cast<BYTE>(offset)), 250);
                     if (!chunk || chunk->size() <= 4)
                         break;
                     for (size_t i = 4; i < chunk->size() && utf8Name.size() < expectedLength; ++i)
@@ -731,7 +754,7 @@ namespace logibattery
 
             if (mouse.battery1000)
             {
-                auto ret = transport.Transact(MakeRequest(mouse.deviceIndex, *mouse.battery1000, 0x00), 300);
+                auto ret = transport.Transact(MakeFapRequest(mouse.deviceIndex, *mouse.battery1000, 0x00), 300);
                 if (ret && ret->size() >= 7)
                 {
                     snapshot.percent = std::clamp<int>((*ret)[4], 0, 100);
@@ -743,7 +766,7 @@ namespace logibattery
 
             if (mouse.battery1001)
             {
-                auto ret = transport.Transact(MakeRequest(mouse.deviceIndex, *mouse.battery1001, 0x00), 300);
+                auto ret = transport.Transact(MakeFapRequest(mouse.deviceIndex, *mouse.battery1001, 0x00), 300);
                 if (ret && ret->size() >= 7)
                 {
                     snapshot.milliVolts = (static_cast<int>((*ret)[4]) << 8) | (*ret)[5];
@@ -770,7 +793,7 @@ namespace logibattery
 
             if (mouse.battery1004)
             {
-                auto ret = transport.Transact(MakeRequest(mouse.deviceIndex, *mouse.battery1004, 0x01), 300);
+                auto ret = transport.Transact(MakeFapRequest(mouse.deviceIndex, *mouse.battery1004, 0x01), 300);
                 if (ret && ret->size() >= 7)
                 {
                     snapshot.percent = std::clamp<int>((*ret)[4], 0, 100);
@@ -808,6 +831,15 @@ namespace logibattery
 
     void LogitechBatteryService::Start()
     {
+        std::lock_guard lifecycleLock(lifecycleMutex_);
+        if (started_.load())
+            return;
+        if (worker_.joinable())
+        {
+            if (worker_.get_id() == std::this_thread::get_id())
+                return;
+            worker_.join();
+        }
         bool expected = false;
         if (!started_.compare_exchange_strong(expected, true))
             return;
@@ -825,17 +857,23 @@ namespace logibattery
 
     void LogitechBatteryService::Stop()
     {
-        if (!started_.exchange(false))
-            return;
+        std::unique_lock lifecycleLock(lifecycleMutex_);
+        const bool wasStarted = started_.exchange(false);
 
+        if (wasStarted)
         {
-            std::lock_guard lock(wakeMutex_);
-            stopRequested_ = true;
-            refreshRequested_ = true;
+            {
+                std::lock_guard lock(wakeMutex_);
+                stopRequested_ = true;
+                refreshRequested_ = true;
+            }
+            if (stopEvent_)
+                SetEvent(stopEvent_);
+            wakeCv_.notify_all();
         }
-        if (stopEvent_)
-            SetEvent(stopEvent_);
-        wakeCv_.notify_all();
+
+        // Keep the lifecycle lock through join so a concurrent Start cannot
+        // reset stopEvent_ while the old transport is draining pending I/O.
         if (worker_.joinable() && worker_.get_id() != std::this_thread::get_id())
             worker_.join();
     }
@@ -923,6 +961,8 @@ namespace logibattery
             constexpr std::array<BYTE, 7> kCandidateIndices = { 1, 2, 3, 4, 5, 6, 0xFF };
             for (BYTE deviceIndex : kCandidateIndices)
             {
+                if (IsStopEventSignaled(stopEvent_))
+                    return result;
                 auto mouse = ProbeMouse(transport, deviceIndex);
                 if (!mouse)
                     continue;

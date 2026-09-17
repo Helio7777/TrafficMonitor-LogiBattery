@@ -91,26 +91,29 @@ namespace mousebattery
             const DWORD waitResult = WaitForMultipleObjects(waitCount, waitHandles, FALSE, timeoutMs);
             if (waitResult == WAIT_OBJECT_0)
             {
-                if (!GetOverlappedResult(device, &ov, &transferred, FALSE))
+                // Wait for a definitive completion before ov/event/buffer unwind.
+                if (!GetOverlappedResult(device, &ov, &transferred, TRUE))
                     return IoWaitResult::Failed;
                 return IoWaitResult::Completed;
             }
 
-            if (waitResult == WAIT_TIMEOUT || (stopEvent && waitResult == WAIT_OBJECT_0 + 1))
+            const bool stopped = stopEvent && waitResult == WAIT_OBJECT_0 + 1;
+            const bool timedOut = waitResult == WAIT_TIMEOUT;
+            // This includes WAIT_FAILED: after ERROR_IO_PENDING, the request
+            // must be cancelled and drained before its storage is released.
+            CancelIoEx(device, &ov);
+            DWORD completionBytes = 0;
+            if (!GetOverlappedResult(device, &ov, &completionBytes, TRUE))
             {
-                const bool stopped = stopEvent && waitResult == WAIT_OBJECT_0 + 1;
-                CancelIoEx(device, &ov);
-                DWORD completionBytes = 0;
-                if (!GetOverlappedResult(device, &ov, &completionBytes, TRUE))
-                {
-                    const DWORD error = GetLastError();
-                    if (error != ERROR_OPERATION_ABORTED)
-                        return IoWaitResult::Failed;
-                }
-                transferred = completionBytes;
-                return stopped ? IoWaitResult::Stopped : IoWaitResult::Timeout;
+                const DWORD error = GetLastError();
+                if (error != ERROR_OPERATION_ABORTED)
+                    return IoWaitResult::Failed;
             }
-
+            transferred = completionBytes;
+            if (stopped)
+                return IoWaitResult::Stopped;
+            if (timedOut)
+                return IoWaitResult::Timeout;
             return IoWaitResult::Failed;
         }
 
@@ -481,6 +484,15 @@ namespace mousebattery
 
     void MchoseBatteryService::Start()
     {
+        std::lock_guard lifecycleLock(lifecycleMutex_);
+        if (started_.load())
+            return;
+        if (worker_.joinable())
+        {
+            if (worker_.get_id() == std::this_thread::get_id())
+                return;
+            worker_.join();
+        }
         bool expected = false;
         if (!started_.compare_exchange_strong(expected, true))
             return;
@@ -498,17 +510,22 @@ namespace mousebattery
 
     void MchoseBatteryService::Stop()
     {
-        if (!started_.exchange(false))
-            return;
+        std::unique_lock lifecycleLock(lifecycleMutex_);
+        const bool wasStarted = started_.exchange(false);
 
+        if (wasStarted)
         {
-            std::lock_guard lock(wakeMutex_);
-            stopRequested_ = true;
-            refreshRequested_ = true;
+            {
+                std::lock_guard lock(wakeMutex_);
+                stopRequested_ = true;
+                refreshRequested_ = true;
+            }
+            if (stopEvent_)
+                SetEvent(stopEvent_);
+            wakeCv_.notify_all();
         }
-        if (stopEvent_)
-            SetEvent(stopEvent_);
-        wakeCv_.notify_all();
+
+        // Do not let a new Start reset stopEvent_ before the old I/O has drained.
         if (worker_.joinable() && worker_.get_id() != std::this_thread::get_id())
             worker_.join();
     }
