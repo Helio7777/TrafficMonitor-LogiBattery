@@ -32,6 +32,9 @@ jobs:
       - name: Build
         shell: pwsh
         run: cmake --build "build-${{ matrix.arch }}" --config Release
+      - name: Run logic tests
+        shell: pwsh
+        run: ctest --test-dir "build-${{ matrix.arch }}" -C Release --output-on-failure
       - name: Verify exported TrafficMonitor entry point
         shell: pwsh
         run: |

@@ -1,11 +1,13 @@
 cmake_minimum_required(VERSION 3.20)
-project(TrafficMonitorLogiBattery VERSION 1.1.1 LANGUAGES CXX)
+project(TrafficMonitorLogiBattery VERSION 1.1.2 LANGUAGES CXX)
 
 set(LOGIBATTERY_PROJECT_URL "" CACHE STRING "Public project homepage embedded in plugin metadata")
 
 add_library(LogiBatteryPlugin SHARED
     src/LogiBatteryPlugin.cpp
     src/LogitechHidpp.cpp
+    src/HidppLogic.cpp
+    src/HidppLogic.h
     src/LogitechHidpp.h
     src/MchoseHid.cpp
     src/MchoseHid.h
@@ -43,3 +45,19 @@ target_link_libraries(LogiBatteryPlugin PRIVATE setupapi hid ole32 comctl32)
 set_target_properties(LogiBatteryPlugin PROPERTIES
     OUTPUT_NAME "LogiBatteryPlugin"
 )
+
+enable_testing()
+add_executable(LogiBatteryLogicTests
+    tests/LogicTests.cpp
+    src/HidppLogic.cpp
+    src/HidppLogic.h
+    src/MouseBatteryTypes.h
+)
+target_include_directories(LogiBatteryLogicTests PRIVATE src)
+target_compile_features(LogiBatteryLogicTests PRIVATE cxx_std_17)
+if(MSVC)
+    target_compile_options(LogiBatteryLogicTests PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    set_property(TARGET LogiBatteryLogicTests PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+add_test(NAME LogiBatteryLogicTests COMMAND LogiBatteryLogicTests)

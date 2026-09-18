@@ -6,6 +6,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <windows.h>
 
 #include "MouseBatteryTypes.h"
 
@@ -38,9 +39,11 @@ namespace logibattery
         std::mutex wakeMutex_;
         std::condition_variable wakeCv_;
         std::thread worker_;
+        std::mutex lifecycleMutex_;
         std::atomic<bool> started_{ false };
         bool stopRequested_ = false;
         bool refreshRequested_ = false;
+        HANDLE stopEvent_ = nullptr;
 
         // Keep the default deliberately conservative. Frequent HID++ polling can
         // keep some wireless devices awake and reduce battery life.
