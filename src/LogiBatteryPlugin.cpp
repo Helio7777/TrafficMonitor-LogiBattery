@@ -47,6 +47,20 @@ namespace
         return brand == DeviceBrand::Mchose ? L"迈从 / MCHOSE" : L"Logitech / Logi";
     }
 
+    // TrafficMonitor unloads plugins through FreeLibrary().  Pin during the
+    // normal exported-entry path so the process never runs a C++ destructor
+    // which could join a worker while the loader lock is held.  On failure we
+    // keep the singleton inert: leaking a running worker from an unloadable DLL
+    // would be worse than presenting N/A.
+    bool PinThisModuleForProcessLifetime()
+    {
+        HMODULE module = nullptr;
+        return GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+            reinterpret_cast<LPCWSTR>(&PinThisModuleForProcessLifetime),
+            &module) != FALSE;
+    }
+
     class MouseBatteryItem final : public IPluginItem
     {
     public:
@@ -120,8 +134,12 @@ namespace
     public:
         static MouseBatteryPlugin& Instance()
         {
-            static MouseBatteryPlugin instance;
-            return instance;
+            // Intentionally process-lifetime.  The pointer itself has trivial
+            // static destruction; MouseBatteryPlugin and its services are never
+            // destroyed during DLL detach.
+            static MouseBatteryPlugin* instance =
+                new MouseBatteryPlugin(PinThisModuleForProcessLifetime());
+            return *instance;
         }
 
         IPluginItem* GetItem(int index) override
@@ -136,7 +154,15 @@ namespace
             {
                 std::lock_guard lock(serviceMutex_);
                 selected = brand_.load();
-                if (selected == DeviceBrand::Mchose)
+                if (!backgroundWorkEnabled_)
+                {
+                    snapshot.error = L"无法固定插件模块；后台 HID 读取已安全禁用。";
+                }
+                else if (!configurationLoaded_)
+                {
+                    snapshot.error = L"正在加载插件配置。";
+                }
+                else if (selected == DeviceBrand::Mchose)
                 {
                     mchoseService_.Start();
                     snapshot = mchoseService_.GetSnapshot();
@@ -236,7 +262,7 @@ namespace
 
         void OnPluginCommand(int command_index, void*, void*) override
         {
-            if (command_index != 0)
+            if (command_index != 0 || !backgroundWorkEnabled_)
                 return;
 
             std::lock_guard lock(serviceMutex_);
@@ -248,7 +274,9 @@ namespace
 
         void OnInitialize(ITrafficMonitor*) override
         {
-            StartSelectedService();
+            // Configuration is delivered via EI_CONFIG_DIR.  Starting here
+            // would always start Logitech first for an MCHOSE installation.
+            initialized_ = true;
         }
 
         void OnExtenedInfo(ExtendedInfoIndex index, const wchar_t* data) override
@@ -260,10 +288,13 @@ namespace
                 std::lock_guard lock(configMutex_);
                 configDir_ = data;
             }
+            configurationLoaded_ = true;
 
             const DeviceBrand loaded = LoadBrand();
             if (loaded != brand_.load())
                 ApplyBrand(loaded, false);
+            else if (initialized_ && backgroundWorkEnabled_)
+                StartSelectedService();
         }
 
     private:
@@ -283,7 +314,7 @@ namespace
             }
 
             text += L"\n" + (s.deviceName.empty() ? std::wstring(L"Mouse") : s.deviceName);
-            text += L"\n电量: " + std::to_wstring(s.percent) + L"%";
+            text += L"\n电量: " + (s.percent >= 0 ? std::to_wstring(s.percent) + L"%" : L"N/A");
 
             switch (s.status)
             {
@@ -343,6 +374,8 @@ namespace
 
         void StartSelectedService()
         {
+            if (!backgroundWorkEnabled_)
+                return;
             std::lock_guard lock(serviceMutex_);
             if (brand_.load() == DeviceBrand::Mchose)
                 mchoseService_.Start();
@@ -368,7 +401,11 @@ namespace
                     // while the new backend performs its first asynchronous query.
                     item_.Update(BatterySnapshot{});
 
-                    if (brand == DeviceBrand::Mchose)
+                    if (!backgroundWorkEnabled_)
+                    {
+                        // The singleton remains inert if module pinning failed.
+                    }
+                    else if (brand == DeviceBrand::Mchose)
                         mchoseService_.RequestRefresh();
                     else
                         logitechService_.RequestRefresh();
@@ -382,16 +419,16 @@ namespace
             tooltip_ = std::wstring(BrandDisplayName(brand)) + L" 鼠标电量\n正在刷新…";
         }
 
-        MouseBatteryPlugin() = default;
-        ~MouseBatteryPlugin()
+        explicit MouseBatteryPlugin(bool backgroundWorkEnabled)
+            : backgroundWorkEnabled_(backgroundWorkEnabled)
         {
-            std::lock_guard lock(serviceMutex_);
-            logitechService_.Stop();
-            mchoseService_.Stop();
         }
 
         MouseBatteryItem item_;
         std::atomic<DeviceBrand> brand_{ DeviceBrand::Logitech };
+        const bool backgroundWorkEnabled_ = false;
+        bool initialized_ = false;
+        std::atomic<bool> configurationLoaded_{ false };
         logibattery::LogitechBatteryService logitechService_;
         mousebattery::MchoseBatteryService mchoseService_;
 

@@ -13,6 +13,7 @@
 #include <objbase.h>
 
 #include "LogitechHidpp.h"
+#include "HidppLogic.h"
 
 #include <algorithm>
 #include <array>
@@ -106,8 +107,16 @@ namespace logibattery
             Completed,
             Timeout,
             Stopped,
+            DeviceGone,
             Failed,
         };
+
+        IoWaitResult ClassifyIoError(DWORD error)
+        {
+            return error == ERROR_DEVICE_NOT_CONNECTED || error == ERROR_INVALID_HANDLE
+                ? IoWaitResult::DeviceGone
+                : IoWaitResult::Failed;
+        }
 
         IoWaitResult WaitOverlappedIo(HANDLE device,
                                       OVERLAPPED& ov,
@@ -123,7 +132,7 @@ namespace logibattery
                 // Even though the event is signaled, use the blocking form to make
                 // the completion guarantee explicit before ov/event/buffer unwind.
                 if (!GetOverlappedResult(device, &ov, &transferred, TRUE))
-                    return IoWaitResult::Failed;
+                    return ClassifyIoError(GetLastError());
                 return IoWaitResult::Completed;
             }
 
@@ -142,7 +151,7 @@ namespace logibattery
             {
                 const DWORD error = GetLastError();
                 if (error != ERROR_OPERATION_ABORTED)
-                    return IoWaitResult::Failed;
+                    return ClassifyIoError(error);
             }
             transferred = completionBytes;
             if (stopped)
@@ -157,9 +166,11 @@ namespace logibattery
             return stopEvent && WaitForSingleObject(stopEvent, 0) == WAIT_OBJECT_0;
         }
 
-        std::map<std::wstring, EndpointGroup> EnumerateLogitechHidppGroups()
+        std::map<std::pair<std::wstring, USHORT>, EndpointGroup> EnumerateLogitechHidppGroups()
         {
-            std::map<std::wstring, EndpointGroup> groups;
+            // A container may expose more than one vendor-defined collection;
+            // include UsagePage so short/long endpoints cannot cross-pair.
+            std::map<std::pair<std::wstring, USHORT>, EndpointGroup> groups;
 
             GUID hidGuid{};
             HidD_GetHidGuid(&hidGuid);
@@ -242,7 +253,7 @@ namespace logibattery
                 endpoint.inputReportLength = caps.InputReportByteLength;
                 endpoint.outputReportLength = caps.OutputReportByteLength;
 
-                auto& group = groups[GuidToString(containerId)];
+                auto& group = groups[std::make_pair(GuidToString(containerId), caps.UsagePage)];
                 if (caps.Usage == 0x0001)
                 {
                     group.shortEndpoint = std::move(endpoint);
@@ -275,10 +286,10 @@ namespace logibattery
             bool Valid() const { return static_cast<bool>(handle_); }
             HANDLE Handle() const { return static_cast<HANDLE>(handle_.get()); }
 
-            bool Write(const std::vector<uint8_t>& report, DWORD timeoutMs, HANDLE stopEvent)
+            IoWaitResult Write(const std::vector<uint8_t>& report, DWORD timeoutMs, HANDLE stopEvent)
             {
                 if (!Valid() || IsStopEventSignaled(stopEvent))
-                    return false;
+                    return IoWaitResult::Stopped;
 
                 const size_t writeLength = std::max<size_t>(info_.outputReportLength, report.size());
                 std::vector<uint8_t> buffer(writeLength, 0);
@@ -286,7 +297,7 @@ namespace logibattery
 
                 UniqueHandle event = MakeHandle(CreateEventW(nullptr, TRUE, FALSE, nullptr));
                 if (!event)
-                    return false;
+                    return IoWaitResult::Failed;
 
                 OVERLAPPED ov{};
                 ov.hEvent = static_cast<HANDLE>(event.get());
@@ -297,26 +308,26 @@ namespace logibattery
                 {
                     DWORD error = GetLastError();
                     if (error != ERROR_IO_PENDING)
-                        return false;
+                        return ClassifyIoError(error);
                     const IoWaitResult waitResult =
                         WaitOverlappedIo(Handle(), ov, timeoutMs, stopEvent, written);
                     if (waitResult != IoWaitResult::Completed)
-                        return false;
+                        return waitResult;
                 }
-                return written > 0;
+                return written > 0 ? IoWaitResult::Completed : IoWaitResult::Failed;
             }
 
-            bool Read(std::vector<uint8_t>& report, DWORD timeoutMs, HANDLE stopEvent)
+            IoWaitResult Read(std::vector<uint8_t>& report, DWORD timeoutMs, HANDLE stopEvent)
             {
                 if (!Valid() || IsStopEventSignaled(stopEvent))
-                    return false;
+                    return IoWaitResult::Stopped;
 
                 const size_t readLength = info_.inputReportLength >= 7 ? info_.inputReportLength : 20;
                 std::vector<uint8_t> buffer(readLength, 0);
 
                 UniqueHandle event = MakeHandle(CreateEventW(nullptr, TRUE, FALSE, nullptr));
                 if (!event)
-                    return false;
+                    return IoWaitResult::Failed;
 
                 OVERLAPPED ov{};
                 ov.hEvent = static_cast<HANDLE>(event.get());
@@ -326,18 +337,18 @@ namespace logibattery
                 {
                     DWORD error = GetLastError();
                     if (error != ERROR_IO_PENDING)
-                        return false;
+                        return ClassifyIoError(error);
                     const IoWaitResult waitResult =
                         WaitOverlappedIo(Handle(), ov, timeoutMs, stopEvent, read);
                     if (waitResult != IoWaitResult::Completed)
-                        return false;
+                        return waitResult;
                 }
 
                 if (read < 7)
-                    return false;
+                    return IoWaitResult::Failed;
                 buffer.resize(read);
                 report = std::move(buffer);
-                return true;
+                return IoWaitResult::Completed;
             }
 
             void CancelAll()
@@ -351,18 +362,8 @@ namespace logibattery
             UniqueHandle handle_;
         };
 
-        enum class HidppErrorType
-        {
-            None,
-            Hidpp10,
-            Hidpp20,
-        };
-
-        struct HidppError
-        {
-            HidppErrorType type = HidppErrorType::None;
-            BYTE code = 0;
-        };
+        using logic::HidppError;
+        using logic::HidppErrorType;
 
         class HidppTransport
         {
@@ -414,21 +415,31 @@ namespace logibattery
                 if (!writeEndpoint)
                     return std::nullopt;
 
-                {
-                    std::lock_guard queueLock(queueMutex_);
-                    messages_.clear();
-                }
-
-                if (StopRequested())
-                    return std::nullopt;
-                if (!writeEndpoint->Write(txReport, timeoutMs, stopEvent_))
-                    return std::nullopt;
-
                 const auto deadline = std::chrono::steady_clock::now() +
                     std::chrono::milliseconds(timeoutMs);
-
-                for (;;)
+                constexpr unsigned kMaxBusyRetries = 2;
+                for (unsigned attempt = 0; attempt <= kMaxBusyRetries; ++attempt)
                 {
+                    if (StopRequested())
+                        return std::nullopt;
+                    {
+                        std::lock_guard queueLock(queueMutex_);
+                        messages_.clear();
+                    }
+
+                    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        deadline - std::chrono::steady_clock::now());
+                    if (remaining.count() <= 0 ||
+                        writeEndpoint->Write(txReport,
+                            static_cast<DWORD>(std::min<long long>(remaining.count(), timeoutMs)),
+                            stopEvent_) != IoWaitResult::Completed)
+                        return std::nullopt;
+
+                    bool retryBusy = false;
+                    for (;;)
+                    {
+                        if (StopRequested())
+                            return std::nullopt;
                     std::vector<uint8_t> msg;
                     {
                         std::unique_lock queueLock(queueMutex_);
@@ -443,12 +454,32 @@ namespace logibattery
 
                     if (IsResponseForRequest(request, msg))
                         return msg;
-                    if (IsErrorForRequest(request, msg).has_value())
+                    if (const auto error = IsErrorForRequest(request, msg))
+                    {
+                        if (logic::IsBusy(*error) && attempt < kMaxBusyRetries)
+                        {
+                            retryBusy = true;
+                            break;
+                        }
                         return std::nullopt;
+                    }
 
                     if (std::chrono::steady_clock::now() >= deadline)
                         return std::nullopt;
+                    }
+
+                    if (!retryBusy)
+                        return std::nullopt;
+                    {
+                        std::unique_lock queueLock(queueMutex_);
+                        const auto backoffDeadline = std::min(
+                            deadline, std::chrono::steady_clock::now() + std::chrono::milliseconds(20));
+                        cv_.wait_until(queueLock, backoffDeadline, [this] { return StopRequested(); });
+                    }
+                    if (std::chrono::steady_clock::now() >= deadline)
+                        return std::nullopt;
                 }
+                return std::nullopt;
             }
 
             std::optional<std::vector<uint8_t>> TransactFap(const std::vector<uint8_t>& request,
@@ -460,45 +491,14 @@ namespace logibattery
             static bool IsResponseForRequest(const std::vector<uint8_t>& request,
                                              const std::vector<uint8_t>& response)
             {
-                if (request.size() < 4 || response.size() < 4)
-                    return false;
-                if (response[1] != request[1]) // device index
-                    return false;
-                if (response[2] != request[2]) // feature index
-                    return false;
-                if ((response[3] & 0x0F) != (request[3] & 0x0F)) // software id
-                    return false;
-                return (response[3] >> 4) == (request[3] >> 4); // function id
+                return logic::IsResponseForRequest(request, response);
             }
 
             static std::optional<HidppError> IsErrorForRequest(
                 const std::vector<uint8_t>& request,
                 const std::vector<uint8_t>& response)
             {
-                if (request.size() < 4 || response.size() < 5)
-                    return std::nullopt;
-                if (response[1] != request[1])
-                    return std::nullopt;
-
-                if (response[2] == 0x8F)
-                {
-                    if (response.size() < 6)
-                        return std::nullopt;
-                    if (response[3] != request[2] || response[4] != request[3])
-                        return std::nullopt;
-                    return HidppError{ HidppErrorType::Hidpp10, response[5] };
-                }
-
-                if (response[2] == 0xFF)
-                {
-                    if (response.size() < 6)
-                        return std::nullopt;
-                    if (response[3] != request[2] || response[4] != request[3])
-                        return std::nullopt;
-                    return HidppError{ HidppErrorType::Hidpp20, response[5] };
-                }
-
-                return std::nullopt;
+                return logic::ErrorForRequest(request, response);
             }
 
         private:
@@ -558,9 +558,10 @@ namespace logibattery
                 while (!StopRequested())
                 {
                     std::vector<uint8_t> msg;
-                    if (!endpoint.Read(msg, 500, stopEvent_))
+                    const IoWaitResult readResult = endpoint.Read(msg, 500, stopEvent_);
+                    if (readResult != IoWaitResult::Completed)
                     {
-                        if (StopRequested())
+                        if (readResult != IoWaitResult::Timeout)
                             break;
                         continue;
                     }
@@ -648,6 +649,7 @@ namespace logibattery
             std::optional<BYTE> battery1000;
             std::optional<BYTE> battery1001;
             std::optional<BYTE> battery1004;
+            logic::UnifiedBatteryCapabilities unifiedBattery;
         };
 
         std::optional<HidppMouse> ProbeMouse(HidppTransport& transport, BYTE deviceIndex)
@@ -698,48 +700,20 @@ namespace logibattery
             mouse.battery1001 = GetFeatureIndex(transport, deviceIndex, 0x1001);
             mouse.battery1004 = GetFeatureIndex(transport, deviceIndex, 0x1004);
 
+            if (mouse.battery1004)
+            {
+                auto capabilities = transport.TransactFap(
+                    MakeFapRequest(deviceIndex, *mouse.battery1004, 0x00), 250);
+                if (capabilities && capabilities->size() >= 6)
+                {
+                    mouse.unifiedBattery = logic::DecodeUnifiedBatteryCapabilities(
+                        (*capabilities)[4], (*capabilities)[5]);
+                }
+            }
+
             if (!mouse.battery1000 && !mouse.battery1001 && !mouse.battery1004)
                 return std::nullopt;
             return mouse;
-        }
-
-        PowerStatus DecodeLevelStatus(BYTE value, bool feature1000)
-        {
-            // Match LGSTrayBattery's status mapping for 0x1000/0x1004.
-            switch (value)
-            {
-            case 0: return PowerStatus::Discharging;
-            case 1:
-            case 2: return PowerStatus::Charging;
-            case 3: return PowerStatus::Full;
-            case 4: return feature1000 ? PowerStatus::Charging : PowerStatus::NotCharging;
-            default: return PowerStatus::NotCharging;
-            }
-        }
-
-        int VoltageToPercent(int mv)
-        {
-            // Same generic 3.7 V Li-Po curve used by LGSTrayBattery's native HID path.
-            // Kept here because HID++ feature 0x1001 reports voltage rather than percent.
-            static constexpr std::array<int, 100> kMilliVoltLut = {
-                4186, 4156, 4143, 4133, 4122, 4113, 4103, 4094, 4086, 4075,
-                4067, 4059, 4051, 4043, 4035, 4027, 4019, 4011, 4003, 3997,
-                3989, 3983, 3976, 3969, 3961, 3955, 3949, 3942, 3935, 3929,
-                3922, 3916, 3909, 3902, 3896, 3890, 3883, 3877, 3870, 3865,
-                3859, 3853, 3848, 3842, 3837, 3833, 3828, 3824, 3819, 3815,
-                3811, 3808, 3804, 3800, 3797, 3793, 3790, 3787, 3784, 3781,
-                3778, 3775, 3772, 3770, 3767, 3764, 3762, 3759, 3757, 3754,
-                3751, 3748, 3744, 3741, 3737, 3734, 3730, 3726, 3724, 3720,
-                3717, 3714, 3710, 3706, 3702, 3697, 3693, 3688, 3683, 3677,
-                3671, 3666, 3662, 3658, 3654, 3646, 3633, 3612, 3579, 3537,
-            };
-
-            for (size_t i = 0; i < kMilliVoltLut.size(); ++i)
-            {
-                if (mv >= kMilliVoltLut[i])
-                    return std::clamp(static_cast<int>(kMilliVoltLut.size() - i), 0, 100);
-            }
-            return 0;
         }
 
 #ifndef NDEBUG
@@ -771,10 +745,10 @@ namespace logibattery
             const std::vector<uint8_t> otherDeviceError = { kShortReportId, 0x02, 0xFF, 0x0D, request[3], 0x09, 0x00 };
             assert(!HidppTransport::IsErrorForRequest(request, otherDeviceError));
 
-            assert(VoltageToPercent(4300) == 100);
-            assert(VoltageToPercent(4186) == 100);
-            assert(VoltageToPercent(3800) == 47);
-            assert(VoltageToPercent(3000) == 0);
+            assert(logic::VoltageToPercent(4300) == 100);
+            assert(logic::VoltageToPercent(4186) == 100);
+            assert(logic::VoltageToPercent(3800) == 47);
+            assert(logic::VoltageToPercent(3000) == 0);
         }
 #endif
 
@@ -785,15 +759,41 @@ namespace logibattery
             snapshot.online = true;
             snapshot.deviceName = mouse.name;
 
+            // Unified Battery is preferred only when its capabilities promise
+            // a real state-of-charge value.  A capability response that only
+            // exposes coarse levels must not turn its zero SOC placeholder
+            // into a false 0% reading.
+            if (mouse.battery1004 && mouse.unifiedBattery.valid)
+            {
+                auto ret = transport.TransactFap(
+                    MakeFapRequest(mouse.deviceIndex, *mouse.battery1004, 0x01), 300);
+                if (ret && ret->size() >= 7)
+                {
+                    const auto reading = logic::DecodeUnifiedBatteryStatus(
+                        mouse.unifiedBattery, (*ret)[4], (*ret)[6]);
+                    snapshot.status = reading.status;
+                    snapshot.source = L"0x1004";
+                    if (reading.percent)
+                    {
+                        snapshot.percent = *reading.percent;
+                        return snapshot;
+                    }
+                }
+            }
+
             if (mouse.battery1000)
             {
                 auto ret = transport.TransactFap(MakeFapRequest(mouse.deviceIndex, *mouse.battery1000, 0x00), 300);
                 if (ret && ret->size() >= 7)
                 {
-                    snapshot.percent = std::clamp<int>((*ret)[4], 0, 100);
-                    snapshot.status = DecodeLevelStatus((*ret)[6], true);
+                    const auto reading = logic::DecodeBattery1000((*ret)[4], (*ret)[6]);
+                    snapshot.status = reading.status;
                     snapshot.source = L"0x1000";
-                    return snapshot;
+                    if (reading.percent)
+                    {
+                        snapshot.percent = *reading.percent;
+                        return snapshot;
+                    }
                 }
             }
 
@@ -803,7 +803,7 @@ namespace logibattery
                 if (ret && ret->size() >= 7)
                 {
                     snapshot.milliVolts = (static_cast<int>((*ret)[4]) << 8) | (*ret)[5];
-                    snapshot.percent = VoltageToPercent(snapshot.milliVolts);
+                    snapshot.percent = logic::VoltageToPercent(snapshot.milliVolts);
                     BYTE flags = (*ret)[6];
                     if ((flags & 0x80) == 0)
                     {
@@ -824,16 +824,13 @@ namespace logibattery
                 }
             }
 
-            if (mouse.battery1004)
+            // Preserve a meaningful charging/full state even when every
+            // available source has an unknown percentage.  The item renders
+            // this as N/A rather than fabricating zero.
+            if (snapshot.status != PowerStatus::Unknown)
             {
-                auto ret = transport.TransactFap(MakeFapRequest(mouse.deviceIndex, *mouse.battery1004, 0x01), 300);
-                if (ret && ret->size() >= 7)
-                {
-                    snapshot.percent = std::clamp<int>((*ret)[4], 0, 100);
-                    snapshot.status = DecodeLevelStatus((*ret)[6], false);
-                    snapshot.source = L"0x1004";
-                    return snapshot;
-                }
+                snapshot.error = L"设备已连接，但当前电量百分比不可用。";
+                return snapshot;
             }
 
             return std::nullopt;

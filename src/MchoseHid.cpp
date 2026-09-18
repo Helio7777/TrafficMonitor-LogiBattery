@@ -77,8 +77,16 @@ namespace mousebattery
             Completed,
             Timeout,
             Stopped,
+            DeviceGone,
             Failed,
         };
+
+        IoWaitResult ClassifyIoError(DWORD error)
+        {
+            return error == ERROR_DEVICE_NOT_CONNECTED || error == ERROR_INVALID_HANDLE
+                ? IoWaitResult::DeviceGone
+                : IoWaitResult::Failed;
+        }
 
         IoWaitResult WaitOverlappedIo(HANDLE device,
                                       OVERLAPPED& ov,
@@ -93,7 +101,7 @@ namespace mousebattery
             {
                 // Wait for a definitive completion before ov/event/buffer unwind.
                 if (!GetOverlappedResult(device, &ov, &transferred, TRUE))
-                    return IoWaitResult::Failed;
+                    return ClassifyIoError(GetLastError());
                 return IoWaitResult::Completed;
             }
 
@@ -105,9 +113,9 @@ namespace mousebattery
             DWORD completionBytes = 0;
             if (!GetOverlappedResult(device, &ov, &completionBytes, TRUE))
             {
-                const DWORD error = GetLastError();
-                if (error != ERROR_OPERATION_ABORTED)
-                    return IoWaitResult::Failed;
+                    const DWORD error = GetLastError();
+                    if (error != ERROR_OPERATION_ABORTED)
+                        return ClassifyIoError(error);
             }
             transferred = completionBytes;
             if (stopped)
@@ -292,6 +300,8 @@ namespace mousebattery
 
         bool SendReloadCommand(HANDLE handle, const MchoseEndpoint& endpoint, HANDLE stopEvent)
         {
+            if (stopEvent && WaitForSingleObject(stopEvent, 0) == WAIT_OBJECT_0)
+                return false;
             if (endpoint.protocol == MchoseProtocol::G3A)
                 return WriteG3ABatteryReport(handle, endpoint, 300, stopEvent);
 
@@ -308,14 +318,17 @@ namespace mousebattery
                     return true;
             }
 
+            if (stopEvent && WaitForSingleObject(stopEvent, 0) == WAIT_OBJECT_0)
+                return false;
+
             return WriteLegacyOutputReport(handle, endpoint, 300, stopEvent);
         }
 
-        bool ReadOneReport(HANDLE handle,
-                           const MchoseEndpoint& endpoint,
-                           std::vector<uint8_t>& out,
-                           DWORD timeoutMs,
-                           HANDLE stopEvent)
+        IoWaitResult ReadOneReport(HANDLE handle,
+                                   const MchoseEndpoint& endpoint,
+                                   std::vector<uint8_t>& out,
+                                   DWORD timeoutMs,
+                                   HANDLE stopEvent)
         {
             // Windows HID expects reads sized to the collection's InputReportByteLength.
             // WebHID hides the report ID, while ReadFile includes it in byte 0.
@@ -326,7 +339,7 @@ namespace mousebattery
 
             UniqueHandle event = MakeHandle(CreateEventW(nullptr, TRUE, FALSE, nullptr));
             if (!event)
-                return false;
+                return IoWaitResult::Failed;
 
             OVERLAPPED ov{};
             ov.hEvent = static_cast<HANDLE>(event.get());
@@ -334,19 +347,20 @@ namespace mousebattery
             BOOL ok = ReadFile(handle, buffer.data(), static_cast<DWORD>(buffer.size()), &bytesRead, &ov);
             if (!ok)
             {
-                if (GetLastError() != ERROR_IO_PENDING)
-                    return false;
+                const DWORD error = GetLastError();
+                if (error != ERROR_IO_PENDING)
+                    return ClassifyIoError(error);
                 const IoWaitResult waitResult =
                     WaitOverlappedIo(handle, ov, timeoutMs, stopEvent, bytesRead);
                 if (waitResult != IoWaitResult::Completed)
-                    return false;
+                    return waitResult;
             }
 
             if (bytesRead == 0)
-                return false;
+                return IoWaitResult::Failed;
             buffer.resize(bytesRead);
             out = std::move(buffer);
-            return true;
+            return IoWaitResult::Completed;
         }
 
         bool ParseE2Report(const std::vector<uint8_t>& report,
@@ -455,8 +469,11 @@ namespace mousebattery
                 const DWORD timeout = static_cast<DWORD>(std::clamp<long long>(remaining.count(), 1, 300));
 
                 std::vector<uint8_t> report;
-                if (!ReadOneReport(handle, endpoint, report, timeout, stopEvent))
+                const IoWaitResult readResult = ReadOneReport(handle, endpoint, report, timeout, stopEvent);
+                if (readResult == IoWaitResult::Timeout)
                     continue;
+                if (readResult != IoWaitResult::Completed)
+                    return false;
                 const bool parsed = endpoint.protocol == MchoseProtocol::G3A
                     ? ParseG3ABatteryReport(report, endpoint, snapshot)
                     : ParseE2Report(report, endpoint, snapshot);
