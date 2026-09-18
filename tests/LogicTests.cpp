@@ -32,6 +32,8 @@ int main()
     const auto e20 = ErrorForRequest(request, { 0x11, 1, 0xFF, 0x0D, 0x2A, 0x08 });
     CHECK(e10 && e10->type == HidppErrorType::Hidpp10 && IsBusy(*e10));
     CHECK(e20 && e20->type == HidppErrorType::Hidpp20 && IsBusy(*e20));
+    const auto unsupported = ErrorForRequest(request, { 0x11, 1, 0xFF, 0x0D, 0x2A, 0x09 });
+    CHECK(unsupported && !IsBusy(*unsupported));
     CHECK(!ErrorForRequest(request, { 0x11, 2, 0xFF, 0x0D, 0x2A, 0x08 }));
 
     BatteryReading discharging = DecodeBattery1000(75, 0);
