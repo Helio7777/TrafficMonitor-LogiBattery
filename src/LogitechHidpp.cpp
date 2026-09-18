@@ -132,6 +132,10 @@ namespace logibattery
             // Every non-completed path after ERROR_IO_PENDING must retire the
             // request before its stack-backed OVERLAPPED, event, and buffer die.
             // This also covers WAIT_FAILED.
+            // CancelIoEx is best-effort: the request may have completed between
+            // the wait and cancellation.  In either case, the blocking
+            // GetOverlappedResult below is the lifetime barrier for ov/event/
+            // buffer and must run for WAIT_TIMEOUT, stop, and WAIT_FAILED alike.
             CancelIoEx(device, &ov);
             DWORD completionBytes = 0;
             if (!GetOverlappedResult(device, &ov, &completionBytes, TRUE))
@@ -374,12 +378,20 @@ namespace logibattery
 
             ~HidppTransport()
             {
+                Stop();
+                if (shortReader_.joinable()) shortReader_.join();
+                if (longReader_.joinable()) longReader_.join();
+            }
+
+            // Stop is deliberately idempotent.  It is also used when the
+            // service-owned stop event is observed, so readers and a waiting
+            // transaction share one cancellation/drain path.
+            void Stop() noexcept
+            {
                 stop_.store(true);
                 short_.CancelAll();
                 long_.CancelAll();
                 cv_.notify_all();
-                if (shortReader_.joinable()) shortReader_.join();
-                if (longReader_.joinable()) longReader_.join();
             }
 
             bool Valid() const { return short_.Valid() || long_.Valid(); }
@@ -387,7 +399,8 @@ namespace logibattery
             bool HasLongReport() const { return long_.Valid(); }
 
             std::optional<std::vector<uint8_t>> Transact(const std::vector<uint8_t>& request,
-                                                         DWORD timeoutMs = 250)
+                                                         DWORD timeoutMs = 250,
+                                                         bool fapRequest = false)
             {
                 if (!Valid() || request.size() < 7 || StopRequested())
                     return std::nullopt;
@@ -397,7 +410,7 @@ namespace logibattery
                     return std::nullopt;
 
                 std::vector<uint8_t> txReport;
-                HidEndpoint* writeEndpoint = SelectWriteEndpoint(request, txReport);
+                HidEndpoint* writeEndpoint = SelectWriteEndpoint(request, txReport, fapRequest);
                 if (!writeEndpoint)
                     return std::nullopt;
 
@@ -436,6 +449,12 @@ namespace logibattery
                     if (std::chrono::steady_clock::now() >= deadline)
                         return std::nullopt;
                 }
+            }
+
+            std::optional<std::vector<uint8_t>> TransactFap(const std::vector<uint8_t>& request,
+                                                            DWORD timeoutMs = 250)
+            {
+                return Transact(request, timeoutMs, true);
             }
 
             static bool IsResponseForRequest(const std::vector<uint8_t>& request,
@@ -483,25 +502,39 @@ namespace logibattery
             }
 
         private:
-            bool StopRequested() const
+            bool StopRequested()
             {
-                return stop_.load() || IsStopEventSignaled(stopEvent_);
+                if (stop_.load())
+                    return true;
+                if (IsStopEventSignaled(stopEvent_))
+                {
+                    Stop();
+                    return true;
+                }
+                return false;
             }
 
             HidEndpoint* SelectWriteEndpoint(const std::vector<uint8_t>& request,
-                                             std::vector<uint8_t>& txReport)
+                                             std::vector<uint8_t>& txReport,
+                                             bool fapRequest)
             {
                 if (request.empty())
                     return nullptr;
 
-                if (request[0] == kLongReportId)
+                // HID++ 2.0 FAP is always sent on the long (0x11) report.
+                // FAP callers construct requests with this report ID; do not
+                // silently move them to short just because short is present.
+                if (fapRequest || request[0] == kLongReportId)
                 {
                     if (!long_.Valid())
                         return nullptr;
                     txReport = request;
+                    txReport[0] = kLongReportId;
                     return &long_;
                 }
 
+                // RAP and protocol-probe requests retain their historical
+                // short-first behavior, with long-only fallback below.
                 if (short_.Valid())
                 {
                     txReport = request;
@@ -597,9 +630,9 @@ namespace logibattery
         std::optional<BYTE> GetFeatureIndex(HidppTransport& transport, BYTE deviceIndex,
                                             USHORT featureId)
         {
-            auto ret = transport.Transact(MakeFapRequest(deviceIndex, 0x00, 0x00,
-                                                         static_cast<BYTE>(featureId >> 8),
-                                                         static_cast<BYTE>(featureId & 0xFF), 0), 250);
+            auto ret = transport.TransactFap(MakeFapRequest(deviceIndex, 0x00, 0x00,
+                                                            static_cast<BYTE>(featureId >> 8),
+                                                            static_cast<BYTE>(featureId & 0xFF), 0), 250);
             if (!ret || ret->size() < 7)
                 return std::nullopt;
             BYTE index = (*ret)[4];
@@ -626,14 +659,14 @@ namespace logibattery
             if (!nameFeature)
                 return std::nullopt;
 
-            auto typeRet = transport.Transact(MakeFapRequest(deviceIndex, *nameFeature, 0x02), 250);
+            auto typeRet = transport.TransactFap(MakeFapRequest(deviceIndex, *nameFeature, 0x02), 250);
             if (!typeRet || typeRet->size() < 5 || (*typeRet)[4] != kMouseDeviceType)
                 return std::nullopt;
 
             HidppMouse mouse;
             mouse.deviceIndex = deviceIndex;
 
-            auto lengthRet = transport.Transact(MakeFapRequest(deviceIndex, *nameFeature, 0x00), 250);
+            auto lengthRet = transport.TransactFap(MakeFapRequest(deviceIndex, *nameFeature, 0x00), 250);
             if (lengthRet && lengthRet->size() >= 5)
             {
                 const size_t expectedLength = (*lengthRet)[4];
@@ -642,8 +675,8 @@ namespace logibattery
                 size_t offset = 0;
                 while (offset < expectedLength && offset < 255)
                 {
-                    auto chunk = transport.Transact(MakeFapRequest(deviceIndex, *nameFeature, 0x01,
-                                                                   static_cast<BYTE>(offset)), 250);
+                    auto chunk = transport.TransactFap(MakeFapRequest(deviceIndex, *nameFeature, 0x01,
+                                                                      static_cast<BYTE>(offset)), 250);
                     if (!chunk || chunk->size() <= 4)
                         break;
                     for (size_t i = 4; i < chunk->size() && utf8Name.size() < expectedLength; ++i)
@@ -754,7 +787,7 @@ namespace logibattery
 
             if (mouse.battery1000)
             {
-                auto ret = transport.Transact(MakeFapRequest(mouse.deviceIndex, *mouse.battery1000, 0x00), 300);
+                auto ret = transport.TransactFap(MakeFapRequest(mouse.deviceIndex, *mouse.battery1000, 0x00), 300);
                 if (ret && ret->size() >= 7)
                 {
                     snapshot.percent = std::clamp<int>((*ret)[4], 0, 100);
@@ -766,7 +799,7 @@ namespace logibattery
 
             if (mouse.battery1001)
             {
-                auto ret = transport.Transact(MakeFapRequest(mouse.deviceIndex, *mouse.battery1001, 0x00), 300);
+                auto ret = transport.TransactFap(MakeFapRequest(mouse.deviceIndex, *mouse.battery1001, 0x00), 300);
                 if (ret && ret->size() >= 7)
                 {
                     snapshot.milliVolts = (static_cast<int>((*ret)[4]) << 8) | (*ret)[5];
@@ -793,7 +826,7 @@ namespace logibattery
 
             if (mouse.battery1004)
             {
-                auto ret = transport.Transact(MakeFapRequest(mouse.deviceIndex, *mouse.battery1004, 0x01), 300);
+                auto ret = transport.TransactFap(MakeFapRequest(mouse.deviceIndex, *mouse.battery1004, 0x01), 300);
                 if (ret && ret->size() >= 7)
                 {
                     snapshot.percent = std::clamp<int>((*ret)[4], 0, 100);
