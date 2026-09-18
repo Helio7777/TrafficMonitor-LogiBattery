@@ -42,10 +42,26 @@ int main()
     CHECK(!chargingUnknown.percent && chargingUnknown.status == PowerStatus::Charging);
     BatteryReading full = DecodeBattery1000(0, 3);
     CHECK(full.percent == 100 && full.status == PowerStatus::Full);
+    CHECK(DecodeBattery1000(50, 0).status == PowerStatus::Discharging);
+    CHECK(DecodeBattery1000(50, 1).status == PowerStatus::Charging);
+    CHECK(DecodeBattery1000(50, 2).status == PowerStatus::Charging);
+    CHECK(DecodeBattery1000(50, 4).status == PowerStatus::Charging);
+    CHECK(DecodeBattery1000(50, 5).status == PowerStatus::Unknown);
+    CHECK(DecodeBattery1000(50, 6).status == PowerStatus::Unknown);
+    CHECK(DecodeBattery1000(50, 7).status == PowerStatus::Unknown);
+    CHECK(DecodeBattery1000(50, 5).status != PowerStatus::NotCharging);
+    CHECK(DecodeBattery1000(50, 6).status != PowerStatus::NotCharging);
+    CHECK(DecodeBattery1000(50, 7).status != PowerStatus::NotCharging);
 
     const auto socCaps = DecodeUnifiedBatteryCapabilities(0, 0x02);
     const auto levelCaps = DecodeUnifiedBatteryCapabilities(0x0F, 0x00);
     CHECK(DecodeUnifiedBatteryStatus(socCaps, 76, 1).percent == 76);
+    CHECK(DecodeUnifiedBatteryStatus(socCaps, 50, 0).status == PowerStatus::Discharging);
+    CHECK(DecodeUnifiedBatteryStatus(socCaps, 50, 1).status == PowerStatus::Charging);
+    CHECK(DecodeUnifiedBatteryStatus(socCaps, 50, 2).status == PowerStatus::Charging);
+    CHECK(DecodeUnifiedBatteryStatus(socCaps, 50, 3).status == PowerStatus::Full);
+    CHECK(DecodeUnifiedBatteryStatus(socCaps, 50, 4).status == PowerStatus::Unknown);
+    CHECK(DecodeUnifiedBatteryStatus(socCaps, 50, 4).status != PowerStatus::NotCharging);
     CHECK(!DecodeUnifiedBatteryStatus(levelCaps, 0, 1).percent);
     BatteryReading voltage{ 47, PowerStatus::Discharging, false };
     CHECK(SelectBestBatteryReading(std::nullopt, chargingUnknown, voltage)->percent == 47);

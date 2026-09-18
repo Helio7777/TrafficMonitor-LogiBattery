@@ -86,7 +86,10 @@ namespace logibattery::logic
         case 2:
         case 4: return mousebattery::PowerStatus::Charging;
         case 3: return mousebattery::PowerStatus::Full;
-        default: return mousebattery::PowerStatus::NotCharging;
+        case 5:
+        case 6:
+        case 7: return mousebattery::PowerStatus::Unknown;
+        default: return mousebattery::PowerStatus::Unknown;
         }
     }
 
@@ -122,7 +125,8 @@ namespace logibattery::logic
         case 1:
         case 2: return mousebattery::PowerStatus::Charging;
         case 3: return mousebattery::PowerStatus::Full;
-        default: return mousebattery::PowerStatus::NotCharging;
+        case 4: return mousebattery::PowerStatus::Unknown;
+        default: return mousebattery::PowerStatus::Unknown;
         }
     }
 
